@@ -324,9 +324,7 @@ def parse_sgf(sgf_text):
     nodes = []
 
     # プロパティのキーと値をマッチする正規表現パターン
-    prop_pattern = re.compile(r'([A-Z]+)
-([^
-]*)\]')
+    prop_pattern = re.compile(r'([A-Z]+)\[([^\]]*)\]')
     for part in parts:
         props = {}
         # 正規表現でプロパティを抽出し、キーはUTF-8エンコード、値はリストに格納
@@ -593,38 +591,6 @@ def process_sgf_to_samples_from_text(sgf_src, board_size, history_length, augmen
     return samples
 
 # ==============================
-# 最良モデル保存用関数
-# ==============================
-def save_best_model(model, policy_accuracy, device, current_best_accuracy):
-    """
-    現在のPolicy Accuracyがこれまでの最高値を更新した場合、以下の処理を実施する：
-      - 状態辞書形式でモデルを保存する
-      - 推論専用モデル（TorchScript化）の保存
-      - MODEL_OUTPUT_DIR内の精度が低いモデルファイルの削除
-      - 新たな最高精度を返す
-    """
-    new_model_file = os.path.join(MODEL_OUTPUT_DIR, f"model_{policy_accuracy:.5f}.pt")
-    # モデルの状態辞書を保存
-    torch.save(model.state_dict(), new_model_file)
-    train_logger.info(f"● New best model saved (state_dict): {new_model_file}")
-
-    # 推論専用モデルのTorchScript化と保存
-    save_inference_model(model, device, "inference2_model.pt")
-
-    # モデル出力ディレクトリ内の他の低精度モデルファイルを削除
-    for f in os.listdir(MODEL_OUTPUT_DIR):
-        if f.startswith("model_") and f.endswith(".pt"):
-            try:
-                acc = float(f[len("model_"):-len(".pt")])
-                if acc < current_best_accuracy and os.path.join(MODEL_OUTPUT_DIR, f) != new_model_file:
-                    os.remove(os.path.join(MODEL_OUTPUT_DIR, f))
-                    train_logger.info(f"Deleted old model: {f}")
-            except Exception:
-                continue
-
-    return max(policy_accuracy, current_best_accuracy)
-
-# ==============================
 # データセットの保存／読み込み関数
 # ==============================
 def save_dataset(samples, output_file):
@@ -658,102 +624,41 @@ def save_inference_model(model, device, model_name):
     model.to(device)  # 元のデバイスに戻す
 
 # ==============================
-# Test用データセット生成（zip利用）
+# 最良モデル保存用関数
 # ==============================
-def prepare_test_dataset(sgf_dir, board_size, history_length, augment_all, output_file):
+def save_best_model(model, policy_accuracy, device, current_best_accuracy):
     """
-    テスト用のデータセットを生成する関数。
-    ・既にpickleファイルが存在する場合はそれをロード。
-    ・無ければ、SGFファイルからzipアーカイブを作成し、そこからサンプルを生成。
-    ・生成したサンプルはpickle形式で保存する。
+    現在のPolicy Accuracyがこれまでの最高値を更新した場合、以下の処理を実施する：
+      - 状態辞書形式でモデルを保存する
+      - 推論専用モデル（TorchScript化）の保存
+      - MODEL_OUTPUT_DIR内の精度が低いモデルファイルの削除
+      - 新たな最高精度を返す
     """
-    if os.path.exists(output_file):
-        sgf_logger.info(f"Test dataset pickle {output_file} already exists. Loading it directly...")
-        return load_dataset(output_file)
+    new_model_file = os.path.join(MODEL_OUTPUT_DIR, f"model_{policy_accuracy:.5f}.pt")
 
-    if not os.path.exists(TEST_SGFS_ZIP):
-        sgf_logger.info(f"Creating zip archive {TEST_SGFS_ZIP} from SGF files in {sgf_dir} ...")
-        sgf_files = [os.path.join(sgf_dir, f) for f in os.listdir(sgf_dir)
-                     if f.endswith('.sgf') and "analyzed" not in f.lower()]
-        with zipfile.ZipFile(TEST_SGFS_ZIP, 'w') as zf:
-            for filepath in sgf_files:
-                zf.write(filepath, arcname=os.path.basename(filepath))
-        sgf_logger.info(f"Zip archive created: {TEST_SGFS_ZIP}")
-    else:
-        sgf_logger.info(f"Zip archive {TEST_SGFS_ZIP} already exists. Loading from it...")
+    # モデルの状態辞書を保存
+    torch.save(model.state_dict(), new_model_file)
+    train_logger.info(f"● New best model saved (state_dict): {new_model_file}")
 
-    all_samples = []
+    # 推論専用モデルのTorchScript化と保存
+    save_inference_model(model, device, "inference2_model.pt")
 
-    with zipfile.ZipFile(TEST_SGFS_ZIP, 'r') as zf:
-        sgf_names = [name for name in zf.namelist() if name.endswith('.sgf') and "analyzed" not in name.lower()]
-        sgf_names.sort()
-        sgf_logger.info(f"TEST: Total SGF files in zip to process: {len(sgf_names)}")
-        for name in tqdm(sgf_names, desc="Processing TEST SGF files"):
+    # モデル出力ディレクトリ内の他の低精度モデルファイルを削除
+    for f in os.listdir(MODEL_OUTPUT_DIR):
+        if f.startswith("model_") and f.endswith(".pt"):
             try:
-                sgf_src = zf.read(name).decode('utf-8')
-                file_samples = process_sgf_to_samples_from_text(sgf_src, board_size, history_length, augment_all=False)
-                all_samples.extend(file_samples)
-            except Exception as e:
-                sgf_logger.error(f"Error processing {name} from zip: {e}")
+                acc = float(f[len("model_"):-len(".pt")])
+                if acc < current_best_accuracy and os.path.join(MODEL_OUTPUT_DIR, f) != new_model_file:
+                    os.remove(os.path.join(MODEL_OUTPUT_DIR, f))
+                    train_logger.info(f"Deleted old model: {f}")
+            except Exception:
+                continue
 
-    save_dataset(all_samples, output_file)
-    sgf_logger.info(f"TEST: Saved test dataset (total samples: {len(all_samples)}) to {output_file}")
-
-    return all_samples
+    return max(policy_accuracy, current_best_accuracy)
 
 # ==============================
-# グローバル変数：未処理のSGFファイルリスト
+# モデル検証
 # ==============================
-remaining_sgf_files = []
-
-def prepare_train_dataset_cycle(sgf_dir, board_size, history_length, augment_all, max_files):
-    """
-    指定フォルダ内のSGFファイルから、1サイクル分の学習サンプルを生成する関数。
-    ・全SGFファイルをランダム順に並び替え、max_files件分だけ処理する。
-    ・ファイルごとにSGFテキストを読み込み、サンプルを生成する。
-    """
-    global remaining_sgf_files
-    if not remaining_sgf_files:
-        all_files = [os.path.join(sgf_dir, f) for f in os.listdir(sgf_dir)
-                     if f.endswith('.sgf') and "analyzed" not in f.lower()]
-        random.shuffle(all_files)
-        remaining_sgf_files = all_files
-        sgf_logger.info("Regenerated the random order of all SGF files.")
-
-    if len(remaining_sgf_files) < max_files:
-        selected_files = remaining_sgf_files
-        remaining_sgf_files = []  # 全部使い切る
-        sgf_logger.info(f"Remaining SGF files less than max_files ({max_files}). Processing {len(selected_files)} files.")
-    else:
-        selected_files = remaining_sgf_files[:max_files]
-        remaining_sgf_files = remaining_sgf_files[max_files:]
-        sgf_logger.info(f"Selected {len(selected_files)} SGF files.")
-
-    all_samples = []
-
-    for sgf_file in selected_files:
-        try:
-            with open(sgf_file, "r", encoding="utf-8") as f:
-                sgf_src = f.read()
-            file_samples = process_sgf_to_samples_from_text(sgf_src, board_size, history_length, augment_all)
-            all_samples.extend(file_samples)
-        except Exception as e:
-            sgf_logger.error(f"Error processing file {sgf_file}: {e}")
-
-    random.shuffle(all_samples)
-    sgf_logger.info(f"Training dataset cycle created. Total samples: {len(all_samples)}")
-
-    return all_samples
-
-def load_training_dataset(sgf_dir, board_size, history_length, augment_all, max_files):
-    """
-    トレーニング用のデータセットを一度だけ生成し、AlphaZeroSGFDatasetPreloadedのインスタンスとして返す。
-    """
-    samples = prepare_train_dataset_cycle(sgf_dir, board_size, history_length, augment_all, max_files)
-    dataset = AlphaZeroSGFDatasetPreloaded(samples)
-
-    return dataset
-
 def validate_model(model, test_loader, device):
     """
     テスト用データセットを用いてモデルのpolicy accuracyを計算する関数。
@@ -777,104 +682,6 @@ def validate_model(model, test_loader, device):
     train_logger.info(f"===== Validation Policy Accuracy ==== 【{policy_accuracy:.5f}】")
 
     return policy_accuracy
-
-# ==============================
-# 訓練ループ用関数（1エポック分）
-# ==============================
-def train_one_iteration(model, train_loader, optimizer, device):
-    """
-    1エポック分の訓練ループを実行する関数
-    ・各バッチごとに損失の計算、逆伝播、パラメータ更新を行う
-    ・policy loss, value loss, margin lossを各々計算して最終損失に加算する
-    ・バッチごとの正解率も計算してログ出力する
-    """
-    model.train()
-    total_loss = 0.0
-    total_policy_loss = 0.0
-    total_value_loss = 0.0
-    total_margin_loss = 0.0
-    num_batches = 0
-    overall_correct = 0
-    overall_samples = 0
-
-    # 損失の重み（ハイパーパラメータ）
-    value_loss_coefficient = 0.1
-    margin_loss_coefficient = 0.0001
-
-    print_interval = 100  # ログ出力するバッチ数の間隔
-    accumulated_accuracy = 0.0
-    group_batches = 0
-
-    for boards, target_policies, target_values, target_margins in tqdm(train_loader, desc="Training", bar_format=bar_fmt):
-        boards = boards.to(device)
-        target_policies = target_policies.to(device)
-        target_values = target_values.to(device)
-        target_margins = target_margins.to(device)
-
-        optimizer.zero_grad()  # 勾配の初期化
-        pred_policy, (pred_value, pred_margin) = model(boards)
-
-        # ポリシー損失は、ターゲットの対数確率との内積による負の和をバッチ数で割る
-        policy_loss = -torch.sum(target_policies * pred_policy) / boards.size(0)
-
-        # 値とマージンに対する平均二乗誤差
-        value_loss = F.mse_loss(pred_value.view(-1), target_values.view(-1))
-        margin_loss = F.mse_loss(pred_margin.view(-1), target_margins.view(-1))
-        loss = policy_loss + value_loss_coefficient * value_loss + margin_loss_coefficient * margin_loss
-        loss.backward()  # 逆伝播
-        optimizer.step()  # パラメータ更新
-
-        if USE_TPU:
-            xm.mark_step()  # TPUの場合、明示的にステップをマークする必要がある
-
-        total_loss += loss.item()
-        total_policy_loss += policy_loss.item()
-        total_value_loss += value_loss.item()
-        total_margin_loss += margin_loss.item()
-        num_batches += 1
-
-        # バッチごとに正解率（予測クラスとターゲットクラスの一致）を計算
-        batch_pred = pred_policy.argmax(dim=1)
-        batch_target = target_policies.argmax(dim=1)
-        batch_accuracy = (batch_pred == batch_target).float().mean().item()
-        overall_correct += (batch_pred == batch_target).sum().item()
-        overall_samples += boards.size(0)
-        accumulated_accuracy += batch_accuracy
-
-        group_batches += 1
-
-        if num_batches % print_interval == 0:
-            avg_accuracy = accumulated_accuracy / group_batches
-            start_batch = num_batches - group_batches + 1
-            end_batch = num_batches
-            print(f"Batch {start_batch:4d}～{end_batch:4d} policy accuracy average: {avg_accuracy:6.4f}")
-            accumulated_accuracy = 0.0
-            group_batches = 0
-
-        del boards, target_policies, target_values, target_margins
-
-    if group_batches > 0:
-        avg_accuracy = accumulated_accuracy / group_batches
-        print(f"Other ({group_batches} batch) policy accuracy average: {avg_accuracy:6.4f}")
-
-    if overall_samples > 0:
-        overall_accuracy = overall_correct / overall_samples
-        print(f"Overall policy accuracy of the latest model state in this training loop: {overall_accuracy:6.4f}")
-    else:
-        overall_accuracy = 0.0
-
-    avg_loss = total_loss / num_batches
-    avg_policy_loss = total_policy_loss / num_batches
-    avg_value_loss = value_loss_coefficient * total_value_loss / num_batches
-    avg_margin_loss = margin_loss_coefficient * total_margin_loss / num_batches
-
-    train_logger.info(f"Training iteration  total average loss: {avg_loss:.5f}")
-    train_logger.info(f"Training iteration average policy loss: {avg_policy_loss:.5f}")
-    train_logger.info(f"Training iteration  average value loss: {avg_value_loss:.5f}")
-    train_logger.info(f"Training iteration average margin loss: {avg_margin_loss:.5f}")
-    train_logger.info(f"Training iteration  overall p accuracy: {overall_accuracy:.5f}")
-
-    return avg_loss
 
 # ==============================
 # チェックポイント保存＆復元
@@ -934,6 +741,202 @@ def load_checkpoint(model, optimizer, checkpoint_file, device):
         return 0, 0.0
 
 # ==============================
+# Test用データセット生成（zip利用）
+# ==============================
+def prepare_test_dataset(sgf_dir, board_size, history_length, augment_all, output_file):
+    """
+    テスト用のデータセットを生成する関数。
+    ・既にpickleファイルが存在する場合はそれをロード。
+    ・無ければ、SGFファイルからzipアーカイブを作成し、そこからサンプルを生成。
+    ・生成したサンプルはpickle形式で保存する。
+    """
+    if os.path.exists(output_file):
+        sgf_logger.info(f"Test dataset pickle {output_file} already exists. Loading it directly...")
+        return load_dataset(output_file)
+
+    if not os.path.exists(TEST_SGFS_ZIP):
+        sgf_logger.info(f"Creating zip archive {TEST_SGFS_ZIP} from SGF files in {sgf_dir} ...")
+        sgf_files = [os.path.join(sgf_dir, f) for f in os.listdir(sgf_dir)
+                     if f.endswith('.sgf') and "analyzed" not in f.lower()]
+        with zipfile.ZipFile(TEST_SGFS_ZIP, 'w') as zf:
+            for filepath in sgf_files:
+                zf.write(filepath, arcname=os.path.basename(filepath))
+        sgf_logger.info(f"Zip archive created: {TEST_SGFS_ZIP}")
+    else:
+        sgf_logger.info(f"Zip archive {TEST_SGFS_ZIP} already exists. Loading from it...")
+
+    all_samples = []
+
+    with zipfile.ZipFile(TEST_SGFS_ZIP, 'r') as zf:
+        sgf_names = [name for name in zf.namelist() if name.endswith('.sgf') and "analyzed" not in name.lower()]
+        sgf_names.sort()
+        sgf_logger.info(f"TEST: Total SGF files in zip to process: {len(sgf_names)}")
+        for name in tqdm(sgf_names, desc="Processing TEST SGF files"):
+            try:
+                sgf_src = zf.read(name).decode('utf-8')
+                file_samples = process_sgf_to_samples_from_text(sgf_src, board_size, history_length, augment_all=False)
+                all_samples.extend(file_samples)
+            except Exception as e:
+                sgf_logger.error(f"Error processing {name} from zip: {e}")
+
+    save_dataset(all_samples, output_file)
+    sgf_logger.info(f"TEST: Saved test dataset (total samples: {len(all_samples)}) to {output_file}")
+
+    return all_samples
+
+# ==============================
+# 訓練データ生成
+# ==============================
+remaining_sgf_files = []
+
+def prepare_train_dataset_cycle(sgf_dir, board_size, history_length, augment_all, max_files):
+    """
+    指定フォルダ内のSGFファイルから、1サイクル分の学習サンプルを生成する関数。
+    ・全SGFファイルをランダム順に並び替え、max_files件分だけ処理する。
+    ・ファイルごとにSGFテキストを読み込み、サンプルを生成する。
+    """
+    global remaining_sgf_files
+
+    if not remaining_sgf_files:
+        all_files = [os.path.join(sgf_dir, f) for f in os.listdir(sgf_dir)
+                     if f.endswith('.sgf') and "analyzed" not in f.lower()]
+        random.shuffle(all_files)
+        remaining_sgf_files = all_files
+        sgf_logger.info("Regenerated the random order of all SGF files.")
+
+    if len(remaining_sgf_files) < max_files:
+        selected_files = remaining_sgf_files
+        remaining_sgf_files = []  # 全部使い切る
+        sgf_logger.info(f"Remaining SGF files less than max_files ({max_files}). Processing {len(selected_files)} files.")
+    else:
+        selected_files = remaining_sgf_files[:max_files]
+        remaining_sgf_files = remaining_sgf_files[max_files:]
+        sgf_logger.info(f"Selected {len(selected_files)} SGF files.")
+
+    all_samples = []
+
+    for sgf_file in selected_files:
+        try:
+            with open(sgf_file, "r", encoding="utf-8") as f:
+                sgf_src = f.read()
+            file_samples = process_sgf_to_samples_from_text(sgf_src, board_size, history_length, augment_all)
+            all_samples.extend(file_samples)
+        except Exception as e:
+            sgf_logger.error(f"Error processing file {sgf_file}: {e}")
+
+    random.shuffle(all_samples)
+    sgf_logger.info(f"Training dataset cycle created. Total samples: {len(all_samples)}")
+
+    return all_samples
+
+def load_training_dataset(sgf_dir, board_size, history_length, augment_all, max_files):
+    """
+    トレーニング用のデータセットを一度だけ生成し、AlphaZeroSGFDatasetPreloadedのインスタンスとして返す。
+    """
+    samples = prepare_train_dataset_cycle(sgf_dir, board_size, history_length, augment_all, max_files)
+    dataset = AlphaZeroSGFDatasetPreloaded(samples)
+
+    return dataset
+
+# ==============================
+# 訓練ループ用関数（1エポック分）
+# ==============================
+def train_one_iteration(model, train_loader, optimizer, device):
+    """
+    1エポック分の訓練ループを実行する関数
+    ・各バッチごとに損失の計算、逆伝播、パラメータ更新を行う
+    ・policy loss, value loss, margin lossを各々計算して最終損失に加算する
+    ・バッチごとの正解率も計算してログ出力する
+    """
+    model.train()
+    total_loss = 0.0
+    total_policy_loss = 0.0
+    total_value_loss = 0.0
+    total_margin_loss = 0.0
+    num_batches = 0
+    overall_correct = 0
+    overall_samples = 0
+
+    # 損失の重み（ハイパーパラメータ）
+    value_loss_coefficient = 0.05
+    margin_loss_coefficient = 0.0001
+
+    print_interval = 100  # ログ出力するバッチ数の間隔
+    accumulated_accuracy = 0.0
+    group_batches = 0
+
+    for boards, target_policies, target_values, target_margins in tqdm(train_loader, desc="Training", bar_format=bar_fmt):
+        boards = boards.to(device)
+        target_policies = target_policies.to(device)
+        target_values = target_values.to(device)
+        target_margins = target_margins.to(device)
+
+        optimizer.zero_grad()  # 勾配の初期化
+        pred_policy, (pred_value, pred_margin) = model(boards)
+
+        # ポリシー損失は、ターゲットの対数確率との内積による負の和をバッチ数で割る
+        policy_loss = -torch.sum(target_policies * pred_policy) / boards.size(0)
+
+        # 値とマージンに対する平均二乗誤差
+        value_loss = F.mse_loss(pred_value.view(-1), target_values.view(-1))
+        margin_loss = F.mse_loss(pred_margin.view(-1), target_margins.view(-1))
+        loss = policy_loss + value_loss_coefficient * value_loss + margin_loss_coefficient * margin_loss
+        loss.backward()  # 逆伝播
+        optimizer.step()  # パラメータ更新
+
+        if USE_TPU:
+            xm.mark_step()  # TPUの場合、明示的にステップをマークする必要がある
+
+        total_loss += loss.item()
+        total_policy_loss += policy_loss.item()
+        total_value_loss += value_loss.item()
+        total_margin_loss += margin_loss.item()
+        num_batches += 1
+
+        # バッチごとに正解率（予測クラスとターゲットクラスの一致）を計算
+        batch_pred = pred_policy.argmax(dim=1)
+        batch_target = target_policies.argmax(dim=1)
+        batch_accuracy = (batch_pred == batch_target).float().mean().item()
+        overall_correct += (batch_pred == batch_target).sum().item()
+        overall_samples += boards.size(0)
+        accumulated_accuracy += batch_accuracy
+
+        group_batches += 1
+
+        if num_batches % print_interval == 0:
+            avg_accuracy = accumulated_accuracy / group_batches
+            start_batch = num_batches - group_batches + 1
+            end_batch = num_batches
+            print(f" {start_batch:4d}～{end_batch:4d} policy accuracy average: {avg_accuracy:6.4f}")
+            accumulated_accuracy = 0.0
+            group_batches = 0
+
+        del boards, target_policies, target_values, target_margins
+
+    if group_batches > 0:
+        avg_accuracy = accumulated_accuracy / group_batches
+        print(f"Other ({group_batches} batch) policy accuracy average: {avg_accuracy:6.4f}")
+
+    if overall_samples > 0:
+        overall_accuracy = overall_correct / overall_samples
+        print(f"Overall policy accuracy of the latest model state in this training loop: {overall_accuracy:6.4f}")
+    else:
+        overall_accuracy = 0.0
+
+    avg_loss = total_loss / num_batches
+    avg_policy_loss = total_policy_loss / num_batches
+    avg_value_loss = value_loss_coefficient * total_value_loss / num_batches
+    avg_margin_loss = margin_loss_coefficient * total_margin_loss / num_batches
+
+    train_logger.info(f"Training iteration  total average loss: {avg_loss:.5f}")
+    train_logger.info(f"Training iteration average policy loss: {avg_policy_loss:.5f}")
+    train_logger.info(f"Training iteration  average value loss: {avg_value_loss:.5f}")
+    train_logger.info(f"Training iteration average margin loss: {avg_margin_loss:.5f}")
+    train_logger.info(f"Training iteration  overall p accuracy: {overall_accuracy:.5f}")
+
+    return avg_loss
+
+# ==============================
 # TPU分散環境で動作するメイン処理
 # ==============================
 def _mp_fn(rank):
@@ -973,23 +976,31 @@ def _mp_fn(rank):
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', patience=patience, factor=factor)
 
     # チェックポイントから復元
-    start_epoch, best_policy_accuracy = load_checkpoint(model, optimizer, CHECKPOINT_FILE, device)
+    #start_epoch, best_policy_accuracy = load_checkpoint(model, optimizer, CHECKPOINT_FILE, device)
 
-    train_logger.info("Initial best_policy_accuracy: {:.5f}".format(best_policy_accuracy))
-    current_lr = optimizer.param_groups[0]['lr']
-    train_logger.info("Current learning rate : {:.8f}".format(current_lr))
+    #train_logger.info("Initial best_policy_accuracy: {:.5f}".format(best_policy_accuracy))
+    #current_lr = optimizer.param_groups[0]['lr']
+    #train_logger.info("Current learning rate : {:.8f}".format(current_lr))
 
-    # トレーニング用データセットの生成
-    training_dataset = load_training_dataset(TRAIN_SGF_DIR, BOARD_SIZE, HISTORY_LENGTH, augment_all=True, max_files=number_max_files)
-
-    epoch = start_epoch
 
     # 無限ループで学習・評価・チェックポイント保存を繰り返す
     while True:
+        # チェックポイントから復元
+        epoch, best_policy_accuracy = load_checkpoint(model, optimizer, CHECKPOINT_FILE, device)
+        train_logger.info("Initial best_policy_accuracy: {:.5f}".format(best_policy_accuracy))
+        current_lr = optimizer.param_groups[0]['lr']
+        train_logger.info("Current learning rate : {:.8f}".format(current_lr))
+
+        # エポック毎に新しい学習データセット（および DataLoader ）を生成する
+        training_dataset = load_training_dataset(TRAIN_SGF_DIR, BOARD_SIZE, HISTORY_LENGTH, augment_all=True, max_files=number_max_files)
         train_loader = DataLoader(training_dataset, batch_size=batch_size, shuffle=True)
+
         train_one_iteration(model, train_loader, optimizer, device)
+
         epoch += 1
+
         policy_accuracy = validate_model(model, test_loader, device)
+
         if policy_accuracy > best_policy_accuracy:
             best_policy_accuracy = save_best_model(model, policy_accuracy, device, best_policy_accuracy)
         else:
@@ -1000,7 +1011,7 @@ def _mp_fn(rank):
         train_logger.info("Epoch {} - Before scheduler.step(): lr = {:.8f}".format(epoch, lr_before))
         scheduler.step(policy_accuracy)
         lr_after = optimizer.param_groups[0]['lr']
-        train_logger.info("Epoch {} - After scheduler.step(): lr = {:.8f}".format(epoch, lr_after))
+        train_logger.info("Epoch {} - After  scheduler.step(): lr = {:.8f}".format(epoch, lr_after))
 
         # ダミーの評価損失、エポック不改善回数（本実装では利用していない）を用いてチェックポイント保存
         dummy_best_val_loss = 0.0
@@ -1008,6 +1019,8 @@ def _mp_fn(rank):
         save_checkpoint(model, optimizer, epoch, dummy_best_val_loss, dummy_epochs_no_improve, best_policy_accuracy, CHECKPOINT_FILE, device)
         train_logger.info("Iteration completed. Restarting next iteration...\n")
 
+
+#############################################################################################################
 if __name__ == "__main__":
     # コマンドライン引数の設定（設定ファイルとチェックポイントファイルのパスを指定可能）
     parser = argparse.ArgumentParser()
@@ -1028,5 +1041,3 @@ if __name__ == "__main__":
         xmp.spawn(_mp_fn, args=(), nprocs=nprocs)
     else:
         _mp_fn(0)
-
-     
