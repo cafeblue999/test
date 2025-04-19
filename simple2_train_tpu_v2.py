@@ -21,6 +21,7 @@ import torch, torch.nn as nn, torch.optim as optim, torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader  # データセットとデータローダのクラス
 import torch.distributed as dist    # 分散学習に必要なモジュール
 import time                         # 時間計測・待機処理に利用
+import gc  # ファイルの先頭付近に追加
 
 # TPU利用時に必要なtorch_xla関連モジュールをインポート
 if USE_TPU:
@@ -691,12 +692,18 @@ def save_inference_model(model, device, model_name):
     保存後、元のデバイスにモデルを戻す。
     """
     model_cpu = model.cpu()   # モデルをCPUに移動
+    model_cpu.eval()
+
     # 推論のトレース用ダミー入力（形状は [1, NUM_CHANNELS, BOARD_SIZE, BOARD_SIZE]）
     dummy_input = torch.randn(1, NUM_CHANNELS, BOARD_SIZE, BOARD_SIZE, device=torch.device("cpu"))
+
     traced_module = torch.jit.trace(model_cpu, dummy_input)  # TorchScript形式に変換
     inference_model_file = os.path.join(MODEL_OUTPUT_DIR, model_name)
+
     torch.jit.save(traced_module, inference_model_file)  # ファイルに保存
+
     train_logger.info(f"Inference model saved as {inference_model_file}")
+
     model.to(device)  # 元のデバイスに戻す
 
 # ==============================
@@ -717,7 +724,7 @@ def save_best_model(model, policy_accuracy, device, current_best_accuracy):
     train_logger.info(f"● New best model saved (state_dict): {new_model_file}")
 
     # 推論専用モデルの保存
-    save_inference_model(model, device, "inference2_model.pt")
+    save_inference_model(model, device, f"inference2_model_{policy_accuracy:.5f}.pt")
 
     # 既存の低精度モデルファイルを削除する
     for f in os.listdir(MODEL_OUTPUT_DIR):
@@ -936,6 +943,7 @@ def prepare_train_dataset_cycle(sgf_dir, board_size, history_length, resume_flag
         sgf_logger.info(f"Selected {len(selected_files)} SGF files. Remaining files : {len(remaining_sgf_files)}")
 
     all_samples = []
+
     # 選択した各SGFファイルについてサンプル生成を実施
     for sgf_file in selected_files:
         try:
@@ -1053,10 +1061,10 @@ def train_one_iteration(model, train_loader, optimizer, scheduler, device,  epoc
             dummy_best_val_loss = 0.0
             epochs_no_improve = 0.0
             best_policy_accuracy = best_policy_accuracy  # この時点でbest_policy_accuracy
-            
+
             save_checkpoint_nolog(model, optimizer, scheduler, epoch, dummy_best_val_loss, epochs_no_improve, best_policy_accuracy, CHECKPOINT_FILE, device)
-            print(f" checkpoint at epoch {epoch}...")
-            
+            print(f" - checkpoint at epoch {epoch}...")
+
             # タイマーをリセット
             last_checkpoint_time = current_time
 
@@ -1141,11 +1149,18 @@ def _mp_fn(rank):
         epoch, best_policy_accuracy = load_checkpoint(model, optimizer, scheduler, CHECKPOINT_FILE, device)
         train_logger.info("Initial best_policy_accuracy: {:.5f}".format(best_policy_accuracy))
         current_lr = optimizer.param_groups[0]['lr']
-        
+
+        # ■■■ ここで、強制的に新しい学習率に変更する ■■■
+        #new_learning_rate = 0.0001  # 新しい学習率を指定
+        #for param_group in optimizer.param_groups:
+        #    param_group['lr'] = new_learning_rate
+
         # 直接 scheduler の属性から設定内容を取得（例として、scheduler.mode, scheduler.patience, scheduler.factor を使用）
         train_logger.info("Scheduler settings: mode: {}, patience: {:2d}, factor: {:.2f}".format(
             scheduler.mode, scheduler.patience, scheduler.factor))
-        train_logger.info("Current learning rate : {:.8f}".format(current_lr))
+        # 変更後、最新の学習率を取得して表示
+        updated_lr = optimizer.param_groups[0]['lr']
+        train_logger.info("Current learning rate : {:.8f}".format(updated_lr))
 
         # エポック毎に新しい学習データセット（および DataLoader ）を生成
         training_dataset = load_training_dataset(TRAIN_SGF_DIR, BOARD_SIZE, HISTORY_LENGTH, resume_flag,  augment_all=True, max_files=number_max_files)
@@ -1154,6 +1169,12 @@ def _mp_fn(rank):
 
         # 1エポック分の訓練を実施
         train_one_iteration(model, train_loader, optimizer, scheduler, device, epoch, checkpoint_interval, best_policy_accuracy)
+
+        # ここで、学習データセットはもう不要になるので解放する
+        del training_dataset  # オブジェクトへの参照を削除
+        del train_loader
+        gc.collect()  # 明示的にガベージコレクタを呼び出す
+
         epoch += 1
 
         # 訓練後、テスト用データセットでモデル評価を行いpolicy accuracyを算出
