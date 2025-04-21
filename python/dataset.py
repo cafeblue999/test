@@ -8,16 +8,6 @@ from torch.utils.data import Dataset
 from tqdm import tqdm
 from config import TEST_SGFS_ZIP, MODEL_OUTPUT_DIR, sgf_logger, train_logger, bar_fmt, PROGRESS_CHECKPOINT_FILE
 from utils  import BOARD_SIZE, NUM_CHANNELS
-import torch_xla.core.xla_model as xm  # すでにインポート済でなければ追加
-
-def print_tpu_memory():
-    """
-    TPUの空きメモリと全体メモリをMB単位で表示する関数。
-    """
-    mem_info = xm.get_memory_info(xm.xla_device())
-    free_mb = int(mem_info['kb_free']) / 1024
-    total_mb = int(mem_info['kb_total']) / 1024
-    sgf_logger.info(f"[TPU] Memory: {free_mb:.2f} MB free / {total_mb:.2f} MB total")
 
 # ==============================
 # SGFパーサー＆前処理関数
@@ -324,7 +314,7 @@ def save_dataset(samples, output_file):
     """
     with open(output_file, "wb") as f:
         pickle.dump(samples, f)
-    sgf_logger.info(f"Saved dataset to {output_file}")
+    sgf_logger.debug(f"Saved dataset to {output_file}")
 
 def load_dataset(output_file):
     """
@@ -332,7 +322,7 @@ def load_dataset(output_file):
     """
     with open(output_file, "rb") as f:
         samples = pickle.load(f)
-    sgf_logger.info(f"Loaded dataset from {output_file}")
+    sgf_logger.debug(f"Loaded dataset from {output_file}")
     return samples
 
 # ==============================
@@ -405,7 +395,7 @@ def validate_model(model, test_loader, device):
     total_samples_count = 0
 
     with torch.no_grad():  # 評価時は勾配計算を行わない
-        for boards, target_policies, _, _ in tqdm(test_loader, desc="Validation", bar_format=bar_fmt):
+        for boards, target_policies, _, _ in tqdm(test_loader, desc="Validation", bar_format=bar_fmt, miniters=100):
             boards = boards.to(device)
             target_policies = target_policies.to(device)
             pred_policy, _ = model(boards)
@@ -421,20 +411,6 @@ def validate_model(model, test_loader, device):
 # ==============================
 # チェックポイント保存＆復元関数
 # ==============================
-def save_checkpoint(model, optimizer, scheduler, epoch, best_val_loss, epochs_no_improve, best_policy_accuracy, checkpoint_file, device):
-    checkpoint = {
-        'epoch': epoch,
-        'model_state_dict': model.state_dict(),
-        'optimizer_state_dict': optimizer.state_dict(),
-        'scheduler_state_dict': scheduler.state_dict(),  # スケジューラ状態の保存
-        'best_val_loss': best_val_loss,
-        'epochs_no_improve': epochs_no_improve,
-        'best_policy_accuracy': best_policy_accuracy
-    }
-    torch.save(checkpoint, checkpoint_file)
-    sgf_logger.info(f"Checkpoint saved at epoch {epoch} to {checkpoint_file}")
-
-# 訓練中のコンソール表示が崩れないように、ログ出力はしないバージョン
 def save_checkpoint(model, optimizer, scheduler, epoch, best_val_loss, epochs_no_improve, best_policy_accuracy, checkpoint_file, device, batch_idx, base_seed):
     checkpoint = {
         'epoch': epoch,
@@ -450,8 +426,9 @@ def save_checkpoint(model, optimizer, scheduler, epoch, best_val_loss, epochs_no
     torch.save(checkpoint, checkpoint_file)
     sgf_logger.info(f"Checkpoint saved at epoch {epoch} to {checkpoint_file}")
 
+# 訓練中のコンソール表示が崩れないように、ログ出力はしないバージョン
 def save_checkpoint_nolog(model, optimizer, scheduler, epoch, best_val_loss, epochs_no_improve, best_policy_accuracy, checkpoint_file, device,
-batch_idx=-1):
+batch_idx, base_seed):
     """
     訓練中のコンソール表示を行わない版チェックポイント保存。
     """
@@ -463,7 +440,8 @@ batch_idx=-1):
         'best_val_loss': best_val_loss,
         'epochs_no_improve': epochs_no_improve,
         'best_policy_accuracy': best_policy_accuracy,
-        'batch_idx': batch_idx
+        'batch_idx': batch_idx,
+        'base_seed': base_seed
     }
     torch.save(checkpoint, checkpoint_file)
 
@@ -509,7 +487,7 @@ def save_progress_checkpoint(remaining_files):
     """
     with open(PROGRESS_CHECKPOINT_FILE, "wb") as f:
         pickle.dump(remaining_files, f)
-    sgf_logger.info(f"Progress checkpoint saved to {PROGRESS_CHECKPOINT_FILE}")
+    # sgf_logger.info(f"Progress checkpoint saved to {PROGRESS_CHECKPOINT_FILE}")
 
 def load_progress_checkpoint():
     """
@@ -518,12 +496,11 @@ def load_progress_checkpoint():
     if os.path.exists(PROGRESS_CHECKPOINT_FILE):
         with open(PROGRESS_CHECKPOINT_FILE, "rb") as f:
             remaining_files = pickle.load(f)
-        sgf_logger.info(f"Progress checkpoint loaded from {PROGRESS_CHECKPOINT_FILE}")
+        sgf_logger.debug(f"Progress checkpoint loaded from {PROGRESS_CHECKPOINT_FILE}")
         return remaining_files
     else:
-        sgf_logger.info("No progress checkpoint found.")
+        sgf_logger.debug("No progress checkpoint found.")
         return None
-
 # ==============================
 # Test用データセット生成（zip利用）
 # ==============================
@@ -534,7 +511,7 @@ def prepare_test_dataset(sgf_dir, board_size, history_length, augment_all, outpu
     ・生成したサンプルはpickle形式で保存する
     """
     if os.path.exists(output_file):
-        sgf_logger.info(f"Test dataset pickle {output_file} already exists. Loading it directly...")
+        sgf_logger.debug(f"Test dataset pickle {output_file} already exists. Loading it directly...")
         return load_dataset(output_file)
 
     if not os.path.exists(TEST_SGFS_ZIP):

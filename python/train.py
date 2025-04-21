@@ -9,54 +9,32 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 from model import EnhancedResNetPolicyValueNetwork
-
-from dataset import AlphaZeroSGFDatasetPreloaded, prepare_test_dataset, process_sgf_to_samples_from_text, load_progress_checkpoint, save_progress_checkpoint, save_checkpoint_nolog, validate_model, save_best_model, save_inference_model, load_checkpoint, print_tpu_memory
-
-from config import USE_TPU, TRAIN_SGF_DIR, VAL_SGF_DIR, CHECKPOINT_FILE, bar_fmt,sgf_logger, train_logger
-
-from utils import BOARD_SIZE, HISTORY_LENGTH, NUM_CHANNELS, num_residual_blocks, model_channels, batch_size, learning_rate, patience, factor, number_max_files
-
-# TPU用の dist, xm が必要なら明示的に import
+import pickle
+import torch_xla.core.xla_model as xm
 import torch.distributed as dist
-if USE_TPU:
-    import torch_xla.core.xla_model as xm
 
-# dataset.save_checkpoint, load_checkpoint の代わりに、train.py 内で再定義
-def save_checkpoint(model, optimizer, scheduler, epoch, best_val_loss,
-                    epochs_no_improve, best_policy_accuracy,
-                    checkpoint_file, device, batch_idx, base_seed):
-    checkpoint = {
-        'epoch': epoch,
-        'model_state_dict': model.state_dict(),
-        'optimizer_state_dict': optimizer.state_dict(),
-        'scheduler_state_dict': scheduler.state_dict() if scheduler else None,
-        'best_val_loss': best_val_loss,
-        'epochs_no_improve': epochs_no_improve,
-        'best_policy_accuracy': best_policy_accuracy,
-        'batch_idx': batch_idx,         # ← これまでのバッチ位置
-        'base_seed': base_seed          # ← 追加：乱数シード
-    }
-    torch.save(checkpoint, checkpoint_file)
-    sgf_logger.info(f"Checkpoint saved: epoch={epoch}, batch_idx={batch_idx}")
+from dataset import (
+    AlphaZeroSGFDatasetPreloaded,
+    prepare_test_dataset,
+    load_progress_checkpoint,
+    save_progress_checkpoint,
+    save_checkpoint,
+    save_checkpoint_nolog,
+    validate_model,
+    save_best_model,
+    save_inference_model,
+    load_checkpoint,
+    process_sgf_to_samples_from_text
+)
 
-def load_checkpoint(model, optimizer, scheduler, checkpoint_file, device):
-    if os.path.exists(checkpoint_file):
-        checkpoint = torch.load(checkpoint_file, map_location='cpu')
-        epoch      = checkpoint.get('epoch', 0)
-        batch_idx  = checkpoint.get('batch_idx', -1)
-        best_acc   = checkpoint.get('best_policy_accuracy', 0.0)
-        base_seed  = checkpoint.get('base_seed', None)  # ← 追加で取得
-        return epoch, batch_idx, best_acc, base_seed
-    else:
-        return 0, -1, 0.0, None
+from config import USE_TPU, TRAIN_SGF_DIR, VAL_SGF_DIR, CHECKPOINT_FILE, bar_fmt, sgf_logger, train_logger
+
+from utils import BOARD_SIZE, HISTORY_LENGTH, NUM_CHANNELS, num_residual_blocks, model_channels, batch_size, learning_rate, patience, factor, number_max_files, CONFIG_PATH
 
 # グローバル変数（未処理のSGFファイルリスト）
 remaining_sgf_files = []
 
-# グローバル変数として強制再読み込みフラグを定義（プログラム起動時のみ True にする）
-FORCE_RELOAD = False
-
-def prepare_train_dataset_cycle(sgf_dir, board_size, history_length, resume_flag, augment_all, max_files):
+def prepare_train_dataset_cycle(sgf_dir, board_size, history_length, resume_flag, augment_all, max_files, rank=0, nprocs=1):
     """
     指定フォルダ内のSGFファイルから、1サイクル分の学習サンプルを生成する関数。
     ・resume_flag が True の場合、進捗チェックポイントから残りファイルリストを読み込む。
@@ -69,27 +47,61 @@ def prepare_train_dataset_cycle(sgf_dir, board_size, history_length, resume_flag
 
     # resume_flag が True かつ FORCE_RELOAD が False の場合のみ、進捗チェックポイントからロード
     if resume_flag and not FORCE_RELOAD:
+        sgf_logger.debug(f"[rank {rank}] pre_train_ds_cycle:(1)")
         remaining = load_progress_checkpoint()
         if remaining is not None:
             remaining_sgf_files = remaining
 
     # FORCE_RELOAD が True または remaining_sgf_files が空の場合、全ファイルを再読み込みする
+    # 初回または remaining_sgf_files が空のときは rank0 のみ再生成、その後全 rank で同期
     if FORCE_RELOAD or not remaining_sgf_files:
-        all_files = [os.path.join(sgf_dir, f) for f in os.listdir(sgf_dir)
-                     if f.endswith('.sgf') and "analyzed" not in f.lower()]
-        random.shuffle(all_files)
-        remaining_sgf_files = all_files
-        sgf_logger.info(f"Regenerated the random order of all SGF files : {len(all_files)} (FORCE_RELOAD was {FORCE_RELOAD})")
-        # FORCE_RELOAD のフラグは一度強制再読み込みを行ったら False にする
-        FORCE_RELOAD = False
+        sgf_logger.debug(f"[rank {rank}] pre_train_ds_cycle:(2)")
+        if rank == 0:
+            sgf_logger.debug(f"[rank {rank}] pre_train_ds_cycle:(3)")
+            all_files = [os.path.join(sgf_dir, f) for f in os.listdir(sgf_dir)
+                         if f.endswith('.sgf') and "analyzed" not in f.lower()]
+            random.shuffle(all_files)
+            remaining_sgf_files = all_files
+            sgf_logger.info(f"[rank {rank}] pre_train_ds_cycle:Regenerated the random order of all SGF files : {len(all_files)} (FORCE_RELOAD was {FORCE_RELOAD})")
+            # 再読み込み後はフラグをリセット
+            FORCE_RELOAD = False
 
+        # rank0 が remaining_sgf_files を全 rank に broadcast
+        # rank0 が remaining_sgf_files を全 rank に broadcast
+        if nprocs > 1:
+            if USE_TPU:
+                # TPU環境では xm.rendezvous でパスリストを共有
+                payload = pickle.dumps(remaining_sgf_files if rank == 0 else None)
+                payload_list = xm.rendezvous('pre_train_ds_cycle_paths', payload)
+                remaining_sgf_files = pickle.loads(payload_list[0])
+                sgf_logger.info(f"[rank {rank}] pre_train_ds_cycle: broadcast via rendezvous")
+                FORCE_RELOAD = False
+            else:
+                # 通常の分散環境では dist.broadcast_object_list を使用
+                buf = [remaining_sgf_files] if rank == 0 else [None]
+                dist.broadcast_object_list(buf, src=0)
+                remaining_sgf_files = buf[0]
+                sgf_logger.debug(f"[rank {rank}] pre_train_ds_cycle:(4-1)")
+                FORCE_RELOAD = False
+
+            sgf_logger.debug(f"[rank {rank}] pre_train_ds_cycle:(4-2)")
+    
     # 今回処理するファイルリストを取り出す（max_files 件まで）
     if len(remaining_sgf_files) < max_files:
         files_to_process = remaining_sgf_files.copy()
     else:
         files_to_process = remaining_sgf_files[:max_files]
+    
+    sgf_logger.debug(f"[rank {rank}] pre_train_ds_cycle:(5)")
+    
+    # 各 rank に応じてデータを分割（全体の1/nprocsを担当）
+    files_to_process = files_to_process[rank::nprocs]
+    sgf_logger.info(f"[rank {rank}] pre_train_ds_cycle:[rank {rank}] assigned {len(files_to_process)} files.")
 
     all_samples = []
+
+    sgf_logger.debug(f"[rank {rank}] pre_train_ds_cycle:(6)")
+
     # ファイルを1件ずつ処理し、処理後すぐにチェックポイントを更新
     for sgf_file in files_to_process:
         try:
@@ -104,24 +116,33 @@ def prepare_train_dataset_cycle(sgf_dir, board_size, history_length, resume_flag
 
         # 処理済みファイルを remaining_sgf_files から削除
         remaining_sgf_files.remove(sgf_file)
+
+    sgf_logger.debug(f"[rank {rank}] pre_train_ds_cycle:(7)")
     
-    # 最後に1回だけ進捗を保存する（ログ出力もこの時1回だけ）
-    save_progress_checkpoint(remaining_sgf_files)
+    # 最後に1回だけ進捗を保存（rank==0 のみ）
+    if rank == 0:
+        save_progress_checkpoint(remaining_sgf_files)
 
     # サンプルをシャッフルして返却
     random.shuffle(all_samples)
-    sgf_logger.info(f"Processed {len(files_to_process)} files; total samples this cycle: {len(all_samples)}")
+    
+    if rank == 0:
+        sgf_logger.info(f"[rank {rank}] pre_train_ds_cycle:Processed {len(files_to_process)} files; total samples this cycle: {len(all_samples)}")
 
-    print_tpu_memory()
+    #print_tpu_memory()
 
     return all_samples
 
-def load_training_dataset(sgf_dir, board_size, history_length, resume_flag, augment_all, max_files):
+def load_training_dataset(sgf_dir, board_size, history_length, resume_flag, augment_all, max_files, rank=0, nprocs=1):
     """
     トレーニング用のデータセットを一度だけ生成し、
     AlphaZeroSGFDatasetPreloaded のインスタンスとして返す関数。
     """
-    samples = prepare_train_dataset_cycle(sgf_dir, board_size, history_length, resume_flag, augment_all, max_files)
+    samples = prepare_train_dataset_cycle(
+        sgf_dir, board_size, history_length,
+        resume_flag, augment_all, max_files,
+        rank=rank, nprocs=nprocs
+    )
     dataset = AlphaZeroSGFDatasetPreloaded(samples)
 
     return dataset
@@ -131,8 +152,7 @@ def load_training_dataset(sgf_dir, board_size, history_length, resume_flag, augm
 # ==============================
 def train_one_iteration(model, train_loader, optimizer, scheduler, device,
                         epoch, checkpoint_interval, best_policy_accuracy,
-                        resume, start_batch_idx,
-                        checkpoint_file, base_seed):
+                        resume, start_batch_idx, base_seed, rank):
     """
     1エポック分の訓練ループを実行する関数
     ・各バッチごとに、入力に対する損失（policy loss, value loss, margin loss）を計算し、逆伝播を実行する。
@@ -151,7 +171,7 @@ def train_one_iteration(model, train_loader, optimizer, scheduler, device,
     value_loss_coefficient = 0.05
     margin_loss_coefficient = 0.0001
 
-    print_interval = 500  # ログ出力間隔（バッチ数）
+    print_interval = 100  # ログ出力間隔（バッチ数）
     accumulated_accuracy = 0.0
     group_batches = 0
 
@@ -161,22 +181,32 @@ def train_one_iteration(model, train_loader, optimizer, scheduler, device,
     # バッチ単位の再開用インデックスを初期化
     last_batch_idx = -1
 
+    # start_batch_idx が全バッチ数を超えていたらリジューム無効化（全スキップ防止）
+    total_batches = len(train_loader)
+    if resume and start_batch_idx >= total_batches:
+        resume = False
+
     # train_loader 内の各バッチに対してループ
     for i, (boards, target_policies, target_values, target_margins) in enumerate(
-            tqdm(train_loader, desc="Training", bar_format=bar_fmt)):
+            tqdm(train_loader,  desc=f"rank{rank}", leave=True, bar_format=bar_fmt)):
 
         # resume=True のとき、start_batch_idx までのバッチをスキップ
         if resume and i <= start_batch_idx:
+            train_logger.debug(f"[rank {rank}] one_it:(1)")
             continue
 
         # 最後に処理したバッチ番号を記録
         last_batch_idx = i
+
+        train_logger.debug(f"[rank {rank}] one_it:(2)")
 
         # ── 以降は既存のバッチ処理ロジック ──
         boards = boards.to(device)
         target_policies = target_policies.to(device)
         target_values = target_values.to(device)
         target_margins = target_margins.to(device)
+
+        train_logger.debug(f"[rank {rank}] one_it:(3)")
 
         optimizer.zero_grad()
         pred_policy, (pred_value, pred_margin) = model(boards)
@@ -185,12 +215,18 @@ def train_one_iteration(model, train_loader, optimizer, scheduler, device,
         margin_loss = F.mse_loss(pred_margin.view(-1), target_margins.view(-1))
         loss = policy_loss + value_loss_coefficient * value_loss + margin_loss_coefficient * margin_loss
 
-        loss.backward()
-        optimizer.step()
+        train_logger.debug(f"[rank {rank}] one_it:(4)")
 
+        loss.backward()
         if USE_TPU:
-            # TPUの場合、明示的にステップをマークする（計算グラフの同期）
-            xm.mark_step()
+            # TPUの場合、勾配を同期してパラメータ更新
+            import torch_xla.core.xla_model as xm
+            xm.optimizer_step(optimizer, barrier=True)
+        else:
+            # GPU/CPU環境では通常の更新
+            optimizer.step()
+
+        train_logger.debug(f"[rank {rank}] one_it:(5)")
 
         # ロスおよび損失項の累積値を加算
         total_loss += loss.item()
@@ -199,6 +235,8 @@ def train_one_iteration(model, train_loader, optimizer, scheduler, device,
         total_margin_loss += margin_loss.item()
         num_batches += 1
 
+        train_logger.debug(f"[rank {rank}] one_it:(6)")
+        
         # バッチごとに正解率を計算（予測ラベルとターゲットのラベルが一致する割合）
         batch_pred = pred_policy.argmax(dim=1)
         batch_target = target_policies.argmax(dim=1)
@@ -208,36 +246,44 @@ def train_one_iteration(model, train_loader, optimizer, scheduler, device,
         accumulated_accuracy += batch_accuracy
         group_batches += 1
 
+        train_logger.debug(f"[rank {rank}] one_it:(7)")
+
         # print_interval ごとにログ出力
-        if num_batches % print_interval == 0:
+        if num_batches % print_interval == 0 and rank == 0:
             avg_accuracy = accumulated_accuracy / group_batches
             start_batch = num_batches - group_batches + 1
             end_batch = num_batches
-            print(f" {start_batch:5d}～{end_batch:5d} policy accuracy : {avg_accuracy:6.4f}")
+            train_logger.info(f"[rank {rank}] one_it:{start_batch:5d}～{end_batch:5d} policy accuracy : {avg_accuracy:6.4f}")
             accumulated_accuracy = 0.0
             group_batches = 0
 
+        train_logger.debug(f"[rank {rank}] one_it:(8)")
+
         # 定期チェックポイント保存時に batch_idx を渡す
-        current_time = time.time()
-        if current_time - last_checkpoint_time >= checkpoint_interval:
-            save_checkpoint_nolog(
-                model, optimizer, scheduler,
-                epoch, 0.0, 0.0, best_policy_accuracy,
-                CHECKPOINT_FILE, device,
-                batch_idx=last_batch_idx
-            )
-            print(f" - checkpoint at epoch {epoch}...")
+        if rank == 0:
+            current_time = time.time()
+            if current_time - last_checkpoint_time >= checkpoint_interval:
+                save_checkpoint_nolog(
+                    model, optimizer, scheduler,
+                    epoch, 0.0, 0.0, best_policy_accuracy,
+                    CHECKPOINT_FILE, device,
+                    batch_idx=last_batch_idx,
+                    base_seed=base_seed
+                )
+                train_logger.info(f"[rank {rank}] one_it: - checkpoint at epoch {epoch}...")
 
-            # タイマーをリセット
-            last_checkpoint_time = current_time
+                # タイマーをリセット
+                last_checkpoint_time = current_time
 
-    if group_batches > 0:
+    train_logger.debug(f"[rank {rank}] one_it:(9)")
+
+    if group_batches > 0 and rank == 0:
         avg_accuracy = accumulated_accuracy / group_batches
-        print(f"Other ({group_batches} batch) policy accuracy : {avg_accuracy:6.4f}")
+        train_logger.info(f"[rank {rank}] one_it: Other ({group_batches} batch) policy accuracy : {avg_accuracy:6.4f}")
 
-    if overall_samples > 0:
+    if overall_samples > 0 and rank == 0:
         overall_accuracy = overall_correct / overall_samples
-        print(f"Overall policy accuracy of the latest model state in this training loop: {overall_accuracy:6.4f}")
+        train_logger.info(f"[rank {rank}] one_it: Overall policy accuracy of the latest model state in this training loop: {overall_accuracy:6.4f}")
     else:
         overall_accuracy = 0.0
 
@@ -247,32 +293,65 @@ def train_one_iteration(model, train_loader, optimizer, scheduler, device,
     avg_margin_loss = margin_loss_coefficient * total_margin_loss / num_batches
 
     # エポックごとの損失や正解率などをログ出力
-    train_logger.info(f"Training iteration  total  loss: {avg_loss:.5f}")
-    train_logger.info(f"Training iteration  policy loss: {avg_policy_loss:.5f}")
-    train_logger.info(f"Training iteration  value  loss: {avg_value_loss:.5f}")
-    train_logger.info(f"Training iteration  margin loss: {avg_margin_loss:.5f}")
-    train_logger.info(f"Training iteration  policy  acc: {overall_accuracy:.5f}")
+    if rank == 0:
+        train_logger.info(f"[rank {rank}] one_it:Training iteration  total  loss: {avg_loss:.5f}")
+        train_logger.info(f"[rank {rank}] one_it:Training iteration  policy loss: {avg_policy_loss:.5f}")
+        train_logger.info(f"[rank {rank}] one_it:Training iteration  value  loss: {avg_value_loss:.5f}")
+        train_logger.info(f"[rank {rank}] one_it:Training iteration  margin loss: {avg_margin_loss:.5f}")
+        train_logger.info(f"[rank {rank}] one_it:Training iteration  policy  acc: {overall_accuracy:.5f}")
 
     return avg_loss, last_batch_idx
 
 # ==============================
 # TPU分散環境で動作するメイン処理
 # ==============================
-from concurrent.futures import ThreadPoolExecutor
-
+from torch.utils.data.distributed import DistributedSampler
 def _mp_fn(rank):
-    checkpoint_interval = 1800
+
+    checkpoint_interval = 600
     resume_flag = True
+    base_seed = None  # ← 必須：UnboundLocalError防止
 
     # デバイス初期化
+    # デバイス初期化（ordinal = XLA 上の実プロセス番号）
     if USE_TPU:
+        import torch_xla.core.xla_model as xm
+        import torch.distributed as dist
+        device     = xm.xla_device()
+        ordinal    = xm.get_ordinal()
+        world_size = xm.xrt_world_size()
         if not dist.is_initialized():
             dist.init_process_group("xla", init_method='xla://')
-        device = xm.xla_device()
-        train_logger.info(f"Running on TPU device: {device}")
+        train_logger.info(f"[rank {rank}] _mp_fn: Running on TPU device: {device} | rank = {ordinal}, world_size = {world_size}")
     else:
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        train_logger.info(f"Running on device: {device}")
+        device     = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        ordinal    = 0
+        world_size = 1
+        train_logger.info(f"[rank {rank}] _mp_fn: Running on device: {device} | rank = {ordinal}, world_size = {world_size}")
+
+    # ログ用に ordinal を設定
+    train_logger.rank     = ordinal
+    sgf_logger.rank       = ordinal
+    train_logger.is_rank0 = (ordinal == 0)
+    sgf_logger.is_rank0   = (ordinal == 0)
+
+    # アプリケーション開始ログを rank0 のみ出力
+    if train_logger.is_rank0:
+        train_logger.info(f"[rank {rank}] === Starting Training and Validation Loop ===")
+        # ログ出力で設定内容を確認
+        train_logger.info(f"[rank {rank}] ==== Loaded Configuration ====")
+        train_logger.info(f"[rank {rank}] Config file: {CONFIG_PATH}")
+        train_logger.info(f"[rank {rank}] BOARD_SIZE: {BOARD_SIZE}")
+        train_logger.info(f"[rank {rank}] HISTORY_LENGTH: {HISTORY_LENGTH}")
+        train_logger.info(f"[rank {rank}] NUM_CHANNELS: {NUM_CHANNELS}")
+        train_logger.info(f"[rank {rank}] num_residual_blocks: {num_residual_blocks}")
+        train_logger.info(f"[rank {rank}] model_channels: {model_channels}")
+        train_logger.info(f"[rank {rank}] batch_size: {batch_size}")
+        train_logger.info(f"[rank {rank}] learning_rate: {learning_rate}")
+        train_logger.info(f"[rank {rank}] patience: {patience}")
+        train_logger.info(f"[rank {rank}] actor: {factor}")
+        train_logger.info(f"[rank {rank}] number_max_files: {number_max_files}")
+        train_logger.info(f"[rank {rank}] ===============================")
 
     # テストデータ準備
     test_dataset_pickle = os.path.join(VAL_SGF_DIR, "test_dataset.pkl")
@@ -283,126 +362,150 @@ def _mp_fn(rank):
         AlphaZeroSGFDatasetPreloaded(test_samples),
         batch_size=batch_size, shuffle=False
     )
-
-    executor = ThreadPoolExecutor(max_workers=1)
-    future_ds = executor.submit(lambda: load_training_dataset(
-        TRAIN_SGF_DIR, BOARD_SIZE, HISTORY_LENGTH,
-        resume_flag, augment_all=True, max_files=number_max_files
-    ))
-    resume_flag = False
+    sgf_logger.info(f"[rank {rank}] _mp_fn:test_loader end.")
 
     resume_epoch, resume_batch_idx = 0, -1
     mid_epoch_resumed = False
     epoch, best_policy_accuracy = 0, 0.0
 
     try:
+        import pickle
+        import torch_xla.core.xla_model as xm
+
         while True:
-            seed = base_seed + epoch
-            random.seed(seed)
-            np.random.seed(seed)
-            torch.manual_seed(seed)
-
-            # プリフェッチ済みデータセットを取得
-            training_dataset = future_ds.result()
-
-            # 次エポックのプリフェッチ開始（非同期）
-            future_ds = executor.submit(lambda: load_training_dataset(
+            # ── SGFファイルを number_max_files 件ずつ読み込み（重複なくサイクル） ──
+            samples = prepare_train_dataset_cycle(
                 TRAIN_SGF_DIR, BOARD_SIZE, HISTORY_LENGTH,
-                resume_flag, augment_all=True, max_files=number_max_files
-            ))
+                resume_flag, augment_all=True,
+                max_files=number_max_files,
+                rank=ordinal, nprocs=world_size
+            )
+            # 初回のみ resume_flag をリセット
+            resume_flag = False
+            # Dataset 化（rank ごとに分割済み）
+            training_dataset = AlphaZeroSGFDatasetPreloaded(samples)
+            sgf_logger.info(f"[rank {rank}] _mp_fn: prepared {len(samples)} samples this epoch")
 
-            # モデル・最適化・スケジューラ
+            # モデルとオプティマイザ・スケジューラを構築
             model = EnhancedResNetPolicyValueNetwork(
                 BOARD_SIZE, model_channels, num_residual_blocks, NUM_CHANNELS
             ).to(device)
-            train_logger.info(f"model instance to {device}")
+            train_logger.info(f"[rank {rank}] _mp_fn:model instance to {device}")
+
             optimizer = optim.Adam(model.parameters(), lr=learning_rate)
             scheduler = optim.lr_scheduler.ReduceLROnPlateau(
                 optimizer, mode='max', patience=patience, factor=factor
             )
 
-            # checkpoint 復元
-            resume_epoch, best_policy_accuracy, resume_batch_idx, base_seed = load_checkpoint(
+            # チェックポイント読み込み
+            resume_epoch, best_policy_accuracy, resume_batch_idx, loaded_seed = load_checkpoint(
                 model, optimizer, scheduler, CHECKPOINT_FILE, device
             )
-            if base_seed is None:
-                base_seed = random.SystemRandom().randint(0, 2**31 - 1)
-
+            base_seed = loaded_seed if loaded_seed is not None else random.SystemRandom().randint(0, 2**31 - 1)
             epoch = resume_epoch
-            train_logger.info(
-                f"Initial best_policy_accuracy: {best_policy_accuracy:.5f}, "
-                f"resume at epoch={resume_epoch}, batch={resume_batch_idx}"
-            )
 
-            # シャッフル再現のため generator 構築
-            generator = torch.Generator(device=device)
-            generator.manual_seed(base_seed + epoch)
+            seed = base_seed + epoch * world_size + ordinal
+            random.seed(seed)
+            np.random.seed(seed)
+            torch.manual_seed(seed)
 
+            if ordinal == 0:
+                train_logger.info(
+                    f"[rank {rank}] _mp_fn:Initial best_policy_accuracy: {best_policy_accuracy:.5f}, "
+                    f"[rank {rank}] _mp_fn:resume at epoch={resume_epoch}, batch={resume_batch_idx}"
+                )
+
+            # データセットを同期的にロード
+            # training_dataset は既に broadcast→Dataset化済みなので再ロード不要
+            train_logger.info(f"[rank {rank}] _mp_fn: using broadcasted dataset")
+
+            # DataLoader：シャッフルしてバッチ生成
+            num_workers = 1
             train_loader = DataLoader(
                 training_dataset,
                 batch_size=batch_size,
                 shuffle=True,
-                generator=generator
+                drop_last=True,
+                num_workers=num_workers,
+                prefetch_factor=None if num_workers == 0 else 1,
+                persistent_workers=True if num_workers > 0 else False
             )
+            train_logger.info(f"[rank {rank}] _mp_fn:Start epoch {epoch}, {len(train_loader)} batches")
 
-            # 中断復元かどうかの判定
+            # バッチ単位での中断復元判定
             do_resume = (not mid_epoch_resumed) and (epoch == resume_epoch) and (resume_batch_idx >= 0)
             start_idx = resume_batch_idx if do_resume else -1
 
+            train_logger.info(f"[rank {rank}] _mp_fn:train_one_iteration start.")
             avg_loss, last_batch_idx = train_one_iteration(
                 model, train_loader, optimizer, scheduler,
                 device, epoch, checkpoint_interval, best_policy_accuracy,
-                resume=do_resume, start_batch_idx=start_idx
-            )
-            mid_epoch_resumed = mid_epoch_resumed or do_resume
+                do_resume, start_idx, base_seed, ordinal)
 
-            del training_dataset, train_loader
+            mid_epoch_resumed = mid_epoch_resumed or do_resume
+            train_logger.info(f"[rank {rank}] _mp_fn:train_one_iteration end. epoch:{epoch}")
+            
+            # train_loader のみ破棄。training_dataset はループ外で再利用する
+            del train_loader
             gc.collect()
 
-            # 評価と保存
-            policy_accuracy = validate_model(model, test_loader, device)
-            if policy_accuracy > best_policy_accuracy:
-                best_policy_accuracy = save_best_model(
-                    model, policy_accuracy, device, best_policy_accuracy
+            # 評価およびモデル保存
+            policy_accuracy = None
+            if ordinal == 0:
+                policy_accuracy = validate_model(model, test_loader, device)
+                if policy_accuracy > best_policy_accuracy:
+                    best_policy_accuracy = save_best_model(
+                        model, policy_accuracy, device, best_policy_accuracy
+                    )
+                else:
+                    save_inference_model(model, device, "inference3_model_tmp.pt")
+
+            if ordinal == 0:
+                train_logger.info(
+                    f"[rank {rank}] _mp_fn:Epoch {epoch} - Before scheduler.step(): "
+                    f"[rank {rank}] _mp_fn:lr = {optimizer.param_groups[0]['lr']:.8f}"
                 )
-            else:
-                save_inference_model(model, device, "inference3_model_tmp.pt")
-
-            train_logger.info(
-                f"Epoch {epoch} - Before scheduler.step(): "
-                f"lr = {optimizer.param_groups[0]['lr']:.8f}"
-            )
-            scheduler.step(policy_accuracy)
-            train_logger.info(
-                f"Epoch {epoch} - After  scheduler.step(): "
-                f"lr = {optimizer.param_groups[0]['lr']:.8f}"
-            )
-
-            save_checkpoint(
-                model, optimizer, scheduler, epoch + 1,
-                0.0, 0, best_policy_accuracy,
-                CHECKPOINT_FILE, device,
-                batch_idx=-1,
-                base_seed=base_seed
-            )
-            train_logger.info("Iteration completed. Restarting next iteration...\n")
+            
+            if ordinal == 0:
+                scheduler.step(policy_accuracy)
+            
+            if ordinal == 0:
+                train_logger.info(
+                    f"[rank {rank}] _mp_fn:Epoch {epoch} - After  scheduler.step(): "
+                    f"[rank {rank}] _mp_fn:lr = {optimizer.param_groups[0]['lr']:.8f}"
+                )
+            if ordinal == 0:
+                # チェックポイント保存
+                save_checkpoint(
+                    model, optimizer, scheduler, epoch + 1,
+                    0.0, 0, best_policy_accuracy,
+                    CHECKPOINT_FILE, device,
+                    batch_idx=-1,
+                    base_seed=base_seed
+                )
+            if ordinal == 0:
+                train_logger.info(f"[rank {rank}] _mp_fn:Iteration completed. Restarting next iteration...\n")
+            
             epoch += 1
     finally:
-        executor.shutdown()
-
+        pass
 
 # ==============================
 # main処理
 # ==============================
-if __name__ == "__main__":
+# グローバル変数として強制再読み込みフラグを定義（プログラム起動時のみ True にする）
+FORCE_RELOAD = True
 
-    train_logger.info("=== Starting Training and Validation Loop ===")
-
+def main():
+    # ここに各種初期化、設定ロード、ロガー設定など
     if USE_TPU:
-        # TPU利用時は、torch_xla.distributed.xla_multiprocessingを用いてプロセスを起動（ここではnprocs=1）
         import torch_xla.distributed.xla_multiprocessing as xmp
-        nprocs = 1
-        xmp.spawn(_mp_fn, args=(), nprocs=nprocs)
+        xmp.spawn(_mp_fn, args=())  # XLA runtime未初期化状態で呼び出す必要あり
     else:
         # TPUでない場合、シングルプロセスで _mp_fn を呼び出す
         _mp_fn(0)
+
+if __name__ == "__main__":
+    main()
+
+

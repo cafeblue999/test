@@ -20,7 +20,7 @@ def load_config(config_path):
 
     try:
         # BOARDセクション：盤のサイズ（例：19x19）を取得。指定がなければ"19"を使用
-        BOARD_SIZE = int(config.get("BOARD", "board_size", fallback="19"))
+        BOARD_SIZE = int(config.get("BOARD", "BOARD_SIZE", fallback="19"))
         # DATAセクション：履歴の長さを取得。なければ"8"を使用
         HISTORY_LENGTH = int(config.get("DATA", "history_length", fallback="8"))
         # 入力チャネル数は、各履歴で2チャネル（黒、白）＋1チャネル（現在のプレイヤー情報）
@@ -62,7 +62,7 @@ def load_config(config_path):
     }
 
 # 設定ファイルのパス（BASE_DIR配下にあると仮定）
-CONFIG_PATH = os.path.join(BASE_DIR, "config_py.ini")
+CONFIG_PATH = os.path.join(BASE_DIR, "config_py_3.ini")
 # 設定ファイルを読み込み、各パラメータを辞書に格納
 config_params = load_config(CONFIG_PATH)
 
@@ -79,22 +79,5 @@ learning_rate = config_params["learning_rate"]
 patience = config_params["patience"]
 factor = config_params["factor"]
 number_max_files = config_params["number_max_files"]
-
-# ログ出力で設定内容を確認
-train_logger.info("==== Loaded Configuration ====")
-train_logger.info(f"Config file: {CONFIG_PATH}")
-train_logger.info(f"BOARD_SIZE: {BOARD_SIZE}")
-train_logger.info(f"HISTORY_LENGTH: {HISTORY_LENGTH}")
-train_logger.info(f"NUM_CHANNELS: {NUM_CHANNELS}")
-train_logger.info(f"NUM_ACTIONS: {NUM_ACTIONS}")
-train_logger.info(f"num_residual_blocks: {num_residual_blocks}")
-train_logger.info(f"model_channels: {model_channels}")
-train_logger.info(f"num_epochs: {num_epochs}")
-train_logger.info(f"batch_size: {batch_size}")
-train_logger.info(f"learning_rate: {learning_rate}")
-train_logger.info(f"patience: {patience}")
-train_logger.info(f"factor: {factor}")
-train_logger.info(f"number_max_files: {number_max_files}")
-train_logger.info("===============================")
 
 

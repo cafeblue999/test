@@ -12,34 +12,6 @@ from datetime import datetime, timedelta, timezone
 USE_TPU = True      # TPU を利用する場合は True にする
 USE_COLAB = True    # Google Colab 環境で実行する場合は True にする
 
-#  TPU利用時に必要なtorch_xla関連モジュールをインポート
-if USE_TPU:
-    import torch_xla
-    import torch_xla.core.xla_model as xm         # TPUデバイスの取得に使用
-    import torch_xla.distributed.xla_backend       # TPU向けの分散学習の設定
-
-# Google Colab利用時にGoogle Driveをマウントする
-#if USE_COLAB:
-#    try:
-#        from google.colab import drive
-#        # Google Drive を強制的にリマウントする
-#        drive.mount('/content/drive', force_remount=True)
-#    except ImportError:
-#        print("Google Colab module not found.")
-
-# ==============================
-# デバイス設定
-# ==============================
-if USE_TPU:
-    # TPUを利用する場合、torch_xlaを用いてTPUデバイスを取得
-    device = xm.xla_device()
-    # 分散処理のプロセスグループが未初期化なら、xlaプロトコルを用いて初期化
-    if not dist.is_initialized():
-        dist.init_process_group("xla", init_method='xla://')
-else:
-    # TPUを使わない場合は、GPU（CUDA）が利用可能ならGPU、なければCPUを利用
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
 # ==============================
 # ディレクトリ設定
 # ==============================
@@ -75,7 +47,8 @@ def fixed_format_interval(seconds):
 tqdm.format_interval = fixed_format_interval
 
 # プログレスバーのフォーマットを指定（tqdmで利用）
-bar_fmt = "{l_bar}{bar}| {n:>6d}/{total:>6d} [{elapsed}<{remaining}, {rate_fmt}]"
+#bar_fmt = "{l_bar}{bar}| {n:>6d}/{total:>6d} [{elapsed}<{remaining}, {rate_fmt}]"
+bar_fmt="{desc}:{percentage:3.0f}% {n:>4d}/{total:>4d} [{elapsed}<{remaining}, {rate_fmt}]"
 
 # ==============================
 # FileLogger クラス（ログ出力用）
@@ -84,21 +57,63 @@ from datetime import datetime, timedelta, timezone
 
 # JST（日本標準時）
 JST = timezone(timedelta(hours=9), 'JST')
-
+# 1) ログ専用ディレクトリを定義（必要であれば先に os.makedirs で作成）
+LOG_DIR = "/content/drive/My Drive/sgf/logs"
+# 2) rank 環境変数取得
+rank_env = os.environ.get("XRT_SHARD_ORDINAL", os.environ.get("LOCAL_RANK", "0"))
 # ログファイル名をタイムスタンプ付きで作成
 log_timestamp = datetime.now(JST).strftime("%Y%m%d_%H%M%S")
-LOG_FILE_PATH = os.path.join(MODEL_OUTPUT_DIR, f"train_log_{log_timestamp}.log")
+# TPU の各プロセスには XRT_SHARD_ORDINAL が設定されています
+rank_env = os.environ.get("XRT_SHARD_ORDINAL",
+                          os.environ.get("LOCAL_RANK", "0"))
+# rank0判定フラグ
+is_rank0 = (rank_env == "0")
+# rank0のみファイル出力。その他は/dev/null（Windowsなら'nul'）へ捨てる
+if is_rank0:
+    LOG_FILE_PATH = os.path.join(
+        LOG_DIR,
+        f"train_log_{log_timestamp}_rank{rank_env}.log"
+    )
+else:
+    LOG_FILE_PATH = os.devnull
+
+# 環境変数 LOG_LEVEL から出力最小レベルを取得。未定義なら INFO とする
+LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO")
 
 class FileLogger:
     def __init__(self):
+        # ログファイルを開く
         self.log_file = open(LOG_FILE_PATH, "a", encoding="utf-8")
+        # ログレベルマップ
+        self._level_map = {"DEBUG":10, "INFO":20, "WARNING":30, "ERROR":40}
+        # 出力最小レベル（環境変数 LOG_LEVEL か WARNING）
+        self.min_level = self._level_map.get(LOG_LEVEL, 20)
+
+        # 外部からセットされるランク番号用のプレースホルダ
+        self.rank = None
 
     def _write(self, level, message):
+        # レベルフィルタ
+        if self._level_map.get(level, 0) < self.min_level:
+            return
+
+        # タイムスタンプ
         timestamp = datetime.now(JST).strftime("%Y-%m-%d %H:%M:%S")
+        # 実行時にセットされた self.rank を優先
+        # rank_str = str(self.rank) if self.rank is not None else \
+        #           os.environ.get("XRT_SHARD_ORDINAL", os.environ.get("LOCAL_RANK", "0"))
+        #prefix = f"[rank {rank_str}] "
+
+        # 最終的なログ行
         log_line = f"{timestamp} {level}: {message}"
-        print(log_line)  # 標準出力
-        self.log_file.write(log_line + "\n")  # ファイル出力
+
+        # 出力
+        print(log_line)
+        self.log_file.write(log_line + "\n")
         self.log_file.flush()
+
+    def debug(self, message, *args, **kwargs):
+        self._write("DEBUG", message)
 
     def info(self, message, *args, **kwargs):
         self._write("INFO", message)
