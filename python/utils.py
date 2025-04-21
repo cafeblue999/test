@@ -1,6 +1,8 @@
 import os
 import configparser
-from config import BASE_DIR, train_logger
+from config import BASE_DIR, get_logger
+
+train_logger = get_logger()
 
 # ==============================
 # utils関数

@@ -6,8 +6,10 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 from tqdm import tqdm
-from config import TEST_SGFS_ZIP, MODEL_OUTPUT_DIR, sgf_logger, train_logger, bar_fmt, PROGRESS_CHECKPOINT_FILE
+from config import TEST_SGFS_ZIP, MODEL_OUTPUT_DIR, bar_fmt, PROGRESS_CHECKPOINT_FILE, get_logger
 from utils  import BOARD_SIZE, NUM_CHANNELS
+
+train_logger = get_logger()
 
 # ==============================
 # SGFパーサー＆前処理関数
@@ -225,7 +227,7 @@ def process_sgf_to_samples_from_text(sgf_src, board_size, history_length, augmen
     try:
         sgf_data = parse_sgf(sgf_src)
     except Exception as e:
-        sgf_logger.error(f"Error processing SGF text: {e}")
+        train_logger.error(f"Error processing SGF text: {e}")
         return samples
     root = sgf_data["root"]
 
@@ -273,7 +275,7 @@ def process_sgf_to_samples_from_text(sgf_src, board_size, history_length, augmen
                 target_policy = np.zeros(sz * sz + 1, dtype=np.float32)
                 target_policy[row * sz + col] = 1.0  # 該当マスを1に設定
             except Exception as e:
-                sgf_logger.warning(f"Error parsing move in SGF text: {e}")
+                train_logger.warning(f"Error parsing move in SGF text: {e}")
                 target_policy = np.zeros(sz * sz + 1, dtype=np.float32)
                 target_policy[sz * sz] = 1.0
 
@@ -299,7 +301,7 @@ def process_sgf_to_samples_from_text(sgf_src, board_size, history_length, augmen
                 # 盤面状態をコピーして履歴リストに追加
                 history_boards.append(board_obj.board.copy().astype(np.float32))
             except Exception as e:
-                sgf_logger.warning(f"Error updating board from SGF text: {e}")
+                train_logger.warning(f"Error updating board from SGF text: {e}")
         # プレイヤーの交代：黒→白、白→黒
         current_player = 2 if current_player == 1 else 1
 
@@ -314,7 +316,7 @@ def save_dataset(samples, output_file):
     """
     with open(output_file, "wb") as f:
         pickle.dump(samples, f)
-    sgf_logger.debug(f"Saved dataset to {output_file}")
+    train_logger.debug(f"Saved dataset to {output_file}")
 
 def load_dataset(output_file):
     """
@@ -322,7 +324,7 @@ def load_dataset(output_file):
     """
     with open(output_file, "rb") as f:
         samples = pickle.load(f)
-    sgf_logger.debug(f"Loaded dataset from {output_file}")
+    train_logger.debug(f"Loaded dataset from {output_file}")
     return samples
 
 # ==============================
@@ -395,7 +397,8 @@ def validate_model(model, test_loader, device):
     total_samples_count = 0
 
     with torch.no_grad():  # 評価時は勾配計算を行わない
-        for boards, target_policies, _, _ in tqdm(test_loader, desc="Validation", bar_format=bar_fmt, miniters=100):
+        for boards, target_policies, _, _ in tqdm(test_loader, desc="Validation", bar_format=bar_fmt, miniters=100,
+            leave=False, dynamic_ncols=True, position=0):
             boards = boards.to(device)
             target_policies = target_policies.to(device)
             pred_policy, _ = model(boards)
@@ -424,7 +427,7 @@ def save_checkpoint(model, optimizer, scheduler, epoch, best_val_loss, epochs_no
         'base_seed': base_seed
     }
     torch.save(checkpoint, checkpoint_file)
-    sgf_logger.info(f"Checkpoint saved at epoch {epoch} to {checkpoint_file}")
+    train_logger.info(f"Checkpoint saved at epoch {epoch} to {checkpoint_file}")
 
 # 訓練中のコンソール表示が崩れないように、ログ出力はしないバージョン
 def save_checkpoint_nolog(model, optimizer, scheduler, epoch, best_val_loss, epochs_no_improve, best_policy_accuracy, checkpoint_file, device,
@@ -487,7 +490,7 @@ def save_progress_checkpoint(remaining_files):
     """
     with open(PROGRESS_CHECKPOINT_FILE, "wb") as f:
         pickle.dump(remaining_files, f)
-    # sgf_logger.info(f"Progress checkpoint saved to {PROGRESS_CHECKPOINT_FILE}")
+    # train_logger.info(f"Progress checkpoint saved to {PROGRESS_CHECKPOINT_FILE}")
 
 def load_progress_checkpoint():
     """
@@ -496,10 +499,10 @@ def load_progress_checkpoint():
     if os.path.exists(PROGRESS_CHECKPOINT_FILE):
         with open(PROGRESS_CHECKPOINT_FILE, "rb") as f:
             remaining_files = pickle.load(f)
-        sgf_logger.debug(f"Progress checkpoint loaded from {PROGRESS_CHECKPOINT_FILE}")
+        train_logger.debug(f"Progress checkpoint loaded from {PROGRESS_CHECKPOINT_FILE}")
         return remaining_files
     else:
-        sgf_logger.debug("No progress checkpoint found.")
+        train_logger.debug("No progress checkpoint found.")
         return None
 # ==============================
 # Test用データセット生成（zip利用）
@@ -511,19 +514,19 @@ def prepare_test_dataset(sgf_dir, board_size, history_length, augment_all, outpu
     ・生成したサンプルはpickle形式で保存する
     """
     if os.path.exists(output_file):
-        sgf_logger.debug(f"Test dataset pickle {output_file} already exists. Loading it directly...")
+        train_logger.debug(f"Test dataset pickle {output_file} already exists. Loading it directly...")
         return load_dataset(output_file)
 
     if not os.path.exists(TEST_SGFS_ZIP):
-        sgf_logger.info(f"Creating zip archive {TEST_SGFS_ZIP} from SGF files in {sgf_dir} ...")
+        train_logger.info(f"Creating zip archive {TEST_SGFS_ZIP} from SGF files in {sgf_dir} ...")
         sgf_files = [os.path.join(sgf_dir, f) for f in os.listdir(sgf_dir)
                      if f.endswith('.sgf') and "analyzed" not in f.lower()]
         with zipfile.ZipFile(TEST_SGFS_ZIP, 'w') as zf:
             for filepath in sgf_files:
                 zf.write(filepath, arcname=os.path.basename(filepath))
-        sgf_logger.info(f"Zip archive created: {TEST_SGFS_ZIP}")
+        train_logger.info(f"Zip archive created: {TEST_SGFS_ZIP}")
     else:
-        sgf_logger.info(f"Zip archive {TEST_SGFS_ZIP} already exists. Loading from it...")
+        train_logger.info(f"Zip archive {TEST_SGFS_ZIP} already exists. Loading from it...")
 
     all_samples = []
 
@@ -531,18 +534,18 @@ def prepare_test_dataset(sgf_dir, board_size, history_length, augment_all, outpu
         # SGFファイルの名前リストを取得
         sgf_names = [name for name in zf.namelist() if name.endswith('.sgf') and "analyzed" not in name.lower()]
         sgf_names.sort()  # 名前順にソート
-        sgf_logger.info(f"TEST: Total SGF files in zip to process: {len(sgf_names)}")
+        train_logger.info(f"TEST: Total SGF files in zip to process: {len(sgf_names)}")
         for name in tqdm(sgf_names, desc="Processing TEST SGF files"):
             try:
                 sgf_src = zf.read(name).decode('utf-8')
                 file_samples = process_sgf_to_samples_from_text(sgf_src, board_size, history_length, augment_all=False)
                 all_samples.extend(file_samples)
             except Exception as e:
-                sgf_logger.error(f"Error processing {name} from zip: {e}")
+                train_logger.error(f"Error processing {name} from zip: {e}")
 
     # 生成されたサンプルをpickleファイルに保存
     save_dataset(all_samples, output_file)
-    sgf_logger.info(f"TEST: Saved test dataset (total samples: {len(all_samples)}) to {output_file}")
+    train_logger.info(f"TEST: Saved test dataset (total samples: {len(all_samples)}) to {output_file}")
 
     return all_samples
 

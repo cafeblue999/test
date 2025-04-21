@@ -36,6 +36,9 @@ else:
 if not os.path.exists(MODEL_OUTPUT_DIR):
     os.makedirs(MODEL_OUTPUT_DIR)
 
+# sgfファイル用進捗チェックポイントファイルのパス
+PROGRESS_CHECKPOINT_FILE = os.path.join(BASE_DIR, "progress_checkpoint3.pkl")
+
 # ==============================
 # tqdm の表示
 # ==============================
@@ -51,86 +54,72 @@ tqdm.format_interval = fixed_format_interval
 bar_fmt="{desc}:{percentage:3.0f}% {n:>4d}/{total:>4d} [{elapsed}<{remaining}, {rate_fmt}]"
 
 # ==============================
-# FileLogger クラス（ログ出力用）
+# FileLogger（シングルトン対応版）
 # ==============================
-from datetime import datetime, timedelta, timezone
-
-# JST（日本標準時）
+# タイムゾーン設定（日本時間） -----
 JST = timezone(timedelta(hours=9), 'JST')
-# 1) ログ専用ディレクトリを定義（必要であれば先に os.makedirs で作成）
+
+# ログ出力ディレクトリ（Google Drive直下） -----
 LOG_DIR = "/content/drive/My Drive/sgf/logs"
-# 2) rank 環境変数取得
-rank_env = os.environ.get("XRT_SHARD_ORDINAL", os.environ.get("LOCAL_RANK", "0"))
-# ログファイル名をタイムスタンプ付きで作成
-log_timestamp = datetime.now(JST).strftime("%Y%m%d_%H%M%S")
-# TPU の各プロセスには XRT_SHARD_ORDINAL が設定されています
-rank_env = os.environ.get("XRT_SHARD_ORDINAL",
-                          os.environ.get("LOCAL_RANK", "0"))
-# rank0判定フラグ
-is_rank0 = (rank_env == "0")
-# rank0のみファイル出力。その他は/dev/null（Windowsなら'nul'）へ捨てる
-if is_rank0:
-    LOG_FILE_PATH = os.path.join(
-        LOG_DIR,
-        f"train_log_{log_timestamp}_rank{rank_env}.log"
-    )
-else:
-    LOG_FILE_PATH = os.devnull
 
-# 環境変数 LOG_LEVEL から出力最小レベルを取得。未定義なら INFO とする
-LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO")
+# タイムスタンプは実行ごとに固定化（環境変数に保存） -----
+if "TRAIN_LOG_TIMESTAMP" not in os.environ:
+    os.environ["TRAIN_LOG_TIMESTAMP"] = datetime.now(JST).strftime("%Y%m%d_%H%M%S")
+log_timestamp = os.environ["TRAIN_LOG_TIMESTAMP"]
 
+# ログファイルパスの決定（rank0 のみファイル出力、それ以外は捨てる） -----
+LOG_FILE_PATH = os.path.join(LOG_DIR, f"train_log_{log_timestamp}.log")
+
+# ログレベル（環境変数 LOG_LEVEL から制御。未指定なら INFO） -----
+LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO")  # 例: "DEBUG", "INFO", "WARNING", "ERROR"
+
+# ==============================
+# FileLogger クラス定義
+# ==============================
 class FileLogger:
+    """ ファイルへのログ出力を管理するシンプルなロガークラス（print併用） """
     def __init__(self):
-        # ログファイルを開く
-        self.log_file = open(LOG_FILE_PATH, "a", encoding="utf-8")
-        # ログレベルマップ
-        self._level_map = {"DEBUG":10, "INFO":20, "WARNING":30, "ERROR":40}
-        # 出力最小レベル（環境変数 LOG_LEVEL か WARNING）
-        self.min_level = self._level_map.get(LOG_LEVEL, 20)
-
-        # 外部からセットされるランク番号用のプレースホルダ
-        self.rank = None
+        self.log_file = open(LOG_FILE_PATH, "a", encoding="utf-8")  # ファイル追記モード
+        self._level_map = {"DEBUG": 10, "INFO": 20, "WARNING": 30, "ERROR": 40}
+        self.min_level = self._level_map.get(LOG_LEVEL, 20)  # 出力レベル下限
 
     def _write(self, level, message):
-        # レベルフィルタ
+        """ レベル判定付きのファイル/コンソール出力 """
         if self._level_map.get(level, 0) < self.min_level:
             return
 
-        # タイムスタンプ
         timestamp = datetime.now(JST).strftime("%Y-%m-%d %H:%M:%S")
-        # 実行時にセットされた self.rank を優先
-        # rank_str = str(self.rank) if self.rank is not None else \
-        #           os.environ.get("XRT_SHARD_ORDINAL", os.environ.get("LOCAL_RANK", "0"))
-        #prefix = f"[rank {rank_str}] "
-
-        # 最終的なログ行
-        log_line = f"{timestamp} {level}: {message}"
-
-        # 出力
-        print(log_line)
+        log_line = f"{timestamp} {level}:{message}"
+        print(log_line)  # コンソール出力（rank0以外も見える）
         self.log_file.write(log_line + "\n")
         self.log_file.flush()
 
-    def debug(self, message, *args, **kwargs):
-        self._write("DEBUG", message)
-
-    def info(self, message, *args, **kwargs):
-        self._write("INFO", message)
-
-    def warning(self, message, *args, **kwargs):
-        self._write("WARNING", message)
-
-    def error(self, message, *args, **kwargs):
-        self._write("ERROR", message)
+    # 各ログレベルに対応するメソッド
+    def debug(self, message, *args, **kwargs): self._write("DEBUG", message)
+    def info(self, message, *args, **kwargs): self._write("INFO", message)
+    def warning(self, message, *args, **kwargs): self._write("WARNING", message)
+    def error(self, message, *args, **kwargs): self._write("ERROR", message)
 
     def __del__(self):
+        """ ファイルクローズ処理（明示的破棄 or スコープ終了時） """
         if hasattr(self, 'log_file') and self.log_file:
             self.log_file.close()
 
-# ロガーインスタンス生成
-sgf_logger = FileLogger()
-train_logger = FileLogger()
+# ==============================
+# シングルトンとして取得する関数
+# ==============================
 
-# sgfファイル用進捗チェックポイントファイルのパス
-PROGRESS_CHECKPOINT_FILE = os.path.join(BASE_DIR, "progress_checkpoint3.pkl")
+# グローバルに 1 インスタンスだけ保持
+_logger_instance = None
+
+def get_logger():
+    """
+    シングルトンの FileLogger を返す。
+    import 時に初期化されず、呼び出し時に1度だけ作成される。
+    他のファイルから `from config import get_logger` で取得可能。
+    """
+    global _logger_instance
+    if _logger_instance is None:
+        _logger_instance = FileLogger()
+    return _logger_instance
+
