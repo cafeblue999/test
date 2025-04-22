@@ -503,7 +503,7 @@ def _mp_fn(rank):
                     model, optimizer, scheduler, epoch + 1,
                     0.0, 0, best_policy_accuracy,
                     CHECKPOINT_FILE, device,
-                    batch_idx=-1,
+                    batch_idx=last_batch_idx,
                     base_seed=base_seed
                 )
             if ordinal == 0:
