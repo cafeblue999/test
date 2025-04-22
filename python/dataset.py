@@ -355,33 +355,53 @@ def save_inference_model(model, device, model_name):
 # ==============================
 def save_best_model(model, policy_accuracy, device, current_best_accuracy):
     """
-    現在のpolicy accuracyがこれまでの最高を更新した場合に以下を行う：
-      - モデルの状態辞書をファイルに保存
-      - 推論専用モデル（TorchScript）の保存
-      - MODEL_OUTPUT_DIR内で低精度のモデルファイルの削除
-      - 最新の最高値を返す
+    現在の policy_accuracy が最高値を更新したら：
+      1) state_dict モデルを保存
+      2) 推論モデルを保存
+      3) 古いスコア付きファイルを一掃
+      4) 最新の最高値を返す
     """
-    new_model_file = os.path.join(MODEL_OUTPUT_DIR, f"model_{PREFIX}_{policy_accuracy:.5f}.pt")
+    # ── 1) 新規ファイルパスを定義 ──
+    new_model_file     = os.path.join(
+        MODEL_OUTPUT_DIR, f"model_{PREFIX}_{policy_accuracy:.5f}.pt"
+    )
+    new_inference_file = os.path.join(
+        MODEL_OUTPUT_DIR, f"{INFERENCE_MODEL_PREFIX}_{policy_accuracy:.5f}.pt"
+    )
 
-    # モデル状態を保存
+    # ── 2) モデル保存 ──
     torch.save(model.state_dict(), new_model_file)
-    train_logger.info(f"● New best model saved (state_dict): {new_model_file}")
+    train_logger.info(f"● New best model saved: {new_model_file}")
 
-    # 推論専用モデルの保存
-    save_inference_model(model, device, f"{INFERENCE_MODEL_PREFIX}_{policy_accuracy:.5f}.pt")
+    save_inference_model(model, device, os.path.basename(new_inference_file))
 
-    # 既存の低精度モデルファイルを削除する
-    for f in os.listdir(MODEL_OUTPUT_DIR):
-        if f.startswith("model_") and f.endswith(".pt"):
-            try:
-                acc = float(f[len("model_"):-len(".pt")])
-                if acc < current_best_accuracy and os.path.join(MODEL_OUTPUT_DIR, f) != new_model_file:
-                    os.remove(os.path.join(MODEL_OUTPUT_DIR, f))
-                    train_logger.info(f"Deleted old model: {f}")
-            except Exception:
-                continue
+    # ── 3) 古いスコア付きファイルを一掃 ──
+    pattern = re.compile(r'^(?P<prefix>.+_)(?P<score>\d+\.\d+)\.pt$')
 
-    # 現在の最高値と比較して、大きい方を返す
+    groups = {}
+    for fname in os.listdir(MODEL_OUTPUT_DIR):
+        m = pattern.match(fname)
+        if not m:
+            continue
+        prefix = m.group('prefix')        # ex. "model_ALL_" or "inference_ALL_"
+        score  = float(m.group('score'))  # ex. 0.34118
+        groups.setdefault(prefix, []).append((fname, score))
+
+    for prefix, flist in groups.items():
+        # 各プレフィックスで最大スコアを計算
+        max_score = max(score for _, score in flist)
+        for fname, score in flist:
+            if score < max_score:
+                path = os.path.join(MODEL_OUTPUT_DIR, fname)
+                # 新たに保存した model/inference ファイルだけは残す
+                if path not in (new_model_file, new_inference_file):
+                    try:
+                        os.remove(path)
+                        train_logger.info(f"Deleted old file: {fname}")
+                    except OSError as e:
+                        train_logger.warning(f"Failed to delete {fname}: {e}")
+
+    # ── 4) 最新の最高精度を返す ──
     return max(policy_accuracy, current_best_accuracy)
 
 # ==============================
@@ -462,6 +482,7 @@ def recursive_to(data, device):
         return data
 
 def load_checkpoint(model, optimizer, scheduler, checkpoint_file, device):
+
     if os.path.exists(checkpoint_file):
         checkpoint = torch.load(checkpoint_file, map_location=torch.device("cpu"))
         new_state_dict = {k: v.to(device) for k, v in checkpoint['model_state_dict'].items()}
@@ -484,8 +505,6 @@ def load_checkpoint(model, optimizer, scheduler, checkpoint_file, device):
 # ==============================
 # sgfファイル用進捗チェックポイント保存＆復元
 # ==============================
-
-
 def save_progress_checkpoint(remaining_files):
     """
     残りのSGFファイルリストをpickle形式で保存する関数

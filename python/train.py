@@ -358,7 +358,7 @@ def _mp_fn(rank):
         train_logger.info(f"[rank {rank}] batch_size: {batch_size}")
         train_logger.info(f"[rank {rank}] learning_rate: {learning_rate}")
         train_logger.info(f"[rank {rank}] patience: {patience}")
-        train_logger.info(f"[rank {rank}] actor: {factor}")
+        train_logger.info(f"[rank {rank}] factor: {factor}")
         train_logger.info(f"[rank {rank}] number_max_files: {number_max_files}")
         train_logger.info(f"[rank {rank}] ===============================")
 
@@ -411,7 +411,10 @@ def _mp_fn(rank):
             )
 
             # optimizer から復元された現在の学習率を取得
-            if rank == 0:
+            if ordinal == 0:
+                # ■■■ lrを変更 ■■■
+                optimizer.param_groups[0]['lr'] = 0.0001
+
                 current_lr = optimizer.param_groups[0]["lr"]
                 train_logger.info(f"[rank {rank}] =========== params ============")
                 train_logger.info(f"[rank {rank}] learning_rate (from optimizer): {current_lr:.6f}")
