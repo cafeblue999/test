@@ -15,14 +15,16 @@ USE_COLAB = True    # Google Colab 環境で実行する場合は True にする
 # ==============================
 # ディレクトリ設定
 # ==============================
+PREFIX = "ALL"
+
 if USE_COLAB:
     # Google Colab環境向けのディレクトリ設定。Google Drive内の特定のフォルダを利用する
     BASE_DIR = "/content/drive/My Drive/sgf"              # ベースディレクトリ
-    TRAIN_SGF_DIR = os.path.join(BASE_DIR, "train_sgf_KK")  # 学習用SGFファイルのディレクトリ
+    TRAIN_SGF_DIR = os.path.join(BASE_DIR, f"train_sgf_{PREFIX}")  # 学習用SGFファイルのディレクトリ
     VAL_SGF_DIR = os.path.join(BASE_DIR, "test")            # 評価用SGFファイルのディレクトリ
     TEST_SGFS_ZIP = os.path.join(VAL_SGF_DIR, "test_sgfs.zip")# テスト用SGFファイル群をまとめたZIPファイル
     MODEL_OUTPUT_DIR = os.path.join(BASE_DIR, "models")      # モデル出力用ディレクトリ
-    CHECKPOINT_FILE = os.path.join(BASE_DIR, "checkpoint3.pt")  # チェックポイントファイルのパス
+
 else:
     # ローカル環境（例: Windows環境）用のディレクトリ設定
     BASE_DIR = r"D:\igo\simple2"
@@ -30,14 +32,20 @@ else:
     VAL_SGF_DIR = os.path.join(BASE_DIR, "test")
     TEST_SGFS_ZIP = os.path.join(VAL_SGF_DIR, "test_sgfs.zip")
     MODEL_OUTPUT_DIR = os.path.join(BASE_DIR, "models")
-    CHECKPOINT_FILE = os.path.join(BASE_DIR, "checkpoint3.pt")
+
+# sgfファイル用進捗チェックポイントファイルのパス
+INFERENCE_MODEL_PREFIX = F"inference_{PREFIX}"
+CHECKPOINT_FILE_PREFIX = f"checkpoint_{PREFIX}" 
+PROGRESS_CHECKPOINT_FILE_PREFIX = f"progress_checkpoint_{PREFIX}"   
+
+CHECKPOINT_FILE = os.path.join(BASE_DIR, CHECKPOINT_FILE_PREFIX + ".pt")
+PROGRESS_CHECKPOINT_FILE = os.path.join(BASE_DIR, PROGRESS_CHECKPOINT_FILE_PREFIX + ".pkl")
 
 # モデル出力用のディレクトリが存在しない場合は自動で作成
 if not os.path.exists(MODEL_OUTPUT_DIR):
     os.makedirs(MODEL_OUTPUT_DIR)
 
-# sgfファイル用進捗チェックポイントファイルのパス
-PROGRESS_CHECKPOINT_FILE = os.path.join(BASE_DIR, "progress_checkpoint3.pkl")
+
 
 # ==============================
 # tqdm の表示

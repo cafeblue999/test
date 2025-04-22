@@ -6,7 +6,7 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 from tqdm import tqdm
-from config import TEST_SGFS_ZIP, MODEL_OUTPUT_DIR, bar_fmt, PROGRESS_CHECKPOINT_FILE, get_logger
+from config import TEST_SGFS_ZIP, MODEL_OUTPUT_DIR, bar_fmt, PREFIX, INFERENCE_MODEL_PREFIX, PROGRESS_CHECKPOINT_FILE, get_logger
 from utils  import BOARD_SIZE, NUM_CHANNELS
 
 train_logger = get_logger()
@@ -361,14 +361,14 @@ def save_best_model(model, policy_accuracy, device, current_best_accuracy):
       - MODEL_OUTPUT_DIR内で低精度のモデルファイルの削除
       - 最新の最高値を返す
     """
-    new_model_file = os.path.join(MODEL_OUTPUT_DIR, f"model3_{policy_accuracy:.5f}.pt")
+    new_model_file = os.path.join(MODEL_OUTPUT_DIR, f"model_{PREFIX}_{policy_accuracy:.5f}.pt")
 
     # モデル状態を保存
     torch.save(model.state_dict(), new_model_file)
     train_logger.info(f"● New best model saved (state_dict): {new_model_file}")
 
     # 推論専用モデルの保存
-    save_inference_model(model, device, f"inference3_model_{policy_accuracy:.5f}.pt")
+    save_inference_model(model, device, f"{INFERENCE_MODEL_PREFIX}_{policy_accuracy:.5f}.pt")
 
     # 既存の低精度モデルファイルを削除する
     for f in os.listdir(MODEL_OUTPUT_DIR):
@@ -484,6 +484,8 @@ def load_checkpoint(model, optimizer, scheduler, checkpoint_file, device):
 # ==============================
 # sgfファイル用進捗チェックポイント保存＆復元
 # ==============================
+
+
 def save_progress_checkpoint(remaining_files):
     """
     残りのSGFファイルリストをpickle形式で保存する関数
@@ -504,6 +506,7 @@ def load_progress_checkpoint():
     else:
         train_logger.debug("No progress checkpoint found.")
         return None
+
 # ==============================
 # Test用データセット生成（zip利用）
 # ==============================

@@ -27,7 +27,7 @@ from dataset import (
     process_sgf_to_samples_from_text
 )
 
-from config import USE_TPU, TRAIN_SGF_DIR, VAL_SGF_DIR, CHECKPOINT_FILE, bar_fmt, get_logger
+from config import USE_TPU, TRAIN_SGF_DIR, VAL_SGF_DIR, INFERENCE_MODEL_PREFIX, CHECKPOINT_FILE, bar_fmt, get_logger
 
 from utils import BOARD_SIZE, HISTORY_LENGTH, NUM_CHANNELS, num_residual_blocks, model_channels, batch_size, learning_rate, patience, factor, number_max_files, CONFIG_PATH
 
@@ -49,7 +49,7 @@ def prepare_train_dataset_cycle(sgf_dir, board_size, history_length, resume_flag
 
     # resume_flag が True かつ FORCE_RELOAD が False の場合のみ、進捗チェックポイントからロード
     if resume_flag and not FORCE_RELOAD:
-        train_logger.debug(f"[rank {rank}] pre_train_ds_cycle:(1)")
+        train_logger.info(f"[rank {rank}] pre_train_ds_cycle: reloading remaining files.")
         remaining = load_progress_checkpoint()
         if remaining is not None:
             remaining_sgf_files = remaining
@@ -57,14 +57,21 @@ def prepare_train_dataset_cycle(sgf_dir, board_size, history_length, resume_flag
     # FORCE_RELOAD が True または remaining_sgf_files が空の場合、全ファイルを再読み込みする
     # 初回または remaining_sgf_files が空のときは rank0 のみ再生成、その後全 rank で同期
     if FORCE_RELOAD or not remaining_sgf_files:
-        train_logger.debug(f"[rank {rank}] pre_train_ds_cycle:(2)")
+        train_logger.info(f"[rank {rank}] pre_train_ds_cycle: all files reading start.") 
         if rank == 0:
-            train_logger.debug(f"[rank {rank}] pre_train_ds_cycle:(3)")
             all_files = [os.path.join(sgf_dir, f) for f in os.listdir(sgf_dir)
                          if f.endswith('.sgf') and "analyzed" not in f.lower()]
+
+            if not all_files:
+                train_logger.error(f"No SGF files found in directory: {sgf_dir}")
+                # 例外を投げて異常終了させる
+                raise RuntimeError(f"No SGF files to process in '{sgf_dir}'")
+
             random.shuffle(all_files)
             remaining_sgf_files = all_files
+            
             train_logger.info(f"[rank {rank}] pre_train_ds_cycle:Regenerated the random order of all SGF files : {len(all_files)} (FORCE_RELOAD was {FORCE_RELOAD})")
+            
             # 再読み込み後はフラグをリセット
             FORCE_RELOAD = False
 
@@ -72,21 +79,22 @@ def prepare_train_dataset_cycle(sgf_dir, board_size, history_length, resume_flag
         if nprocs > 1:
             if USE_TPU:
                 # TPU環境では xm.rendezvous でパスリストを共有
+                train_logger.info(f"[rank {rank}] pre_train_ds_cycle: pickle dump start.") 
                 payload = pickle.dumps(remaining_sgf_files if rank == 0 else None)
+                train_logger.info(f"[rank {rank}] pre_train_ds_cycle: xm.remdevous start.") 
                 payload_list = xm.rendezvous('pre_train_ds_cycle_paths', payload)
+                train_logger.info(f"[rank {rank}] pre_train_ds_cycle: pickle load start.") 
                 remaining_sgf_files = pickle.loads(payload_list[0])
-                train_logger.debug(f"[rank {rank}] pre_train_ds_cycle: broadcast via rendezvous")
+                train_logger.info(f"[rank {rank}] pre_train_ds_cycle: broadcast via rendezvous")
                 FORCE_RELOAD = False
             else:
                 # 通常の分散環境では dist.broadcast_object_list を使用
                 buf = [remaining_sgf_files] if rank == 0 else [None]
                 dist.broadcast_object_list(buf, src=0)
                 remaining_sgf_files = buf[0]
-                train_logger.debug(f"[rank {rank}] pre_train_ds_cycle:(4-1)")
                 FORCE_RELOAD = False
 
             train_logger.info(f"[rank {rank}] remaning_sgf_files : {len(remaining_sgf_files)}")
-            train_logger.debug(f"[rank {rank}] pre_train_ds_cycle:(4-2)")
     
     # 今回処理するファイルリストを取り出す（max_files 件まで）
     if len(remaining_sgf_files) < max_files:
@@ -403,17 +411,18 @@ def _mp_fn(rank):
             )
 
             # optimizer から復元された現在の学習率を取得
-            current_lr = optimizer.param_groups[0]["lr"]
-            train_logger.info("=========== params ============")
-            train_logger.info(f"learning_rate (from optimizer): {current_lr:.6f}")
-            train_logger.info(f"patience: {patience}")
-            train_logger.info(f"factor: {factor}")
-            train_logger.info(f"number_max_files: {number_max_files}")
-            train_logger.info(f"resume_epoch: {resume_epoch}, resume_batch: {resume_batch_idx}")
-            train_logger.info(f"best_policy_accuracy (from checkpoint): {best_policy_accuracy:.5f}")
-            if loaded_seed is not None:
-                train_logger.info(f"loaded_seed: {loaded_seed}")
-            train_logger.info("===============================")
+            if rank == 0:
+                current_lr = optimizer.param_groups[0]["lr"]
+                train_logger.info(f"[rank {rank}] =========== params ============")
+                train_logger.info(f"[rank {rank}] learning_rate (from optimizer): {current_lr:.6f}")
+                train_logger.info(f"[rank {rank}] patience: {patience}")
+                train_logger.info(f"[rank {rank}] factor: {factor}")
+                train_logger.info(f"[rank {rank}] number_max_files: {number_max_files}")
+                train_logger.info(f"[rank {rank}] resume_epoch: {resume_epoch}, resume_batch: {resume_batch_idx}")
+                train_logger.info(f"[rank {rank}] best_policy_accuracy (from checkpoint): {best_policy_accuracy:.5f}")
+                if loaded_seed is not None:
+                    train_logger.info(f"[rank {rank}] loaded_seed: {loaded_seed}")
+                train_logger.info(f"[rank {rank}] ===============================")
 
             base_seed = loaded_seed if loaded_seed is not None else random.SystemRandom().randint(0, 2**31 - 1)
             epoch = resume_epoch
@@ -472,7 +481,7 @@ def _mp_fn(rank):
                         model, policy_accuracy, device, best_policy_accuracy
                     )
                 else:
-                    save_inference_model(model, device, "inference3_model_tmp.pt")
+                    save_inference_model(model, device, f"{INFERENCE_MODEL_PREFIX}_tmp.pt")
 
             if ordinal == 0:
                 train_logger.info(
@@ -508,7 +517,7 @@ def _mp_fn(rank):
 # main処理
 # ==============================
 # グローバル変数として強制再読み込みフラグを定義（プログラム起動時のみ True にする）
-FORCE_RELOAD = False
+FORCE_RELOAD = True
 
 def main():
     # ここに各種初期化、設定ロード、ロガー設定など
