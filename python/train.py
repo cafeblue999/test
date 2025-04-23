@@ -83,13 +83,13 @@ def prepare_train_dataset_cycle(sgf_dir, board_size, history_length, resume_flag
         if nprocs > 1:
             if USE_TPU:
                 # TPU環境では xm.rendezvous でパスリストを共有
-                train_logger.info(f"[rank {rank}] pre_train_ds_cycle: pickle dump start.") 
+                train_logger.debug(f"[rank {rank}] pre_train_ds_cycle: pickle dump start.") 
                 payload = pickle.dumps(remaining_sgf_files if rank == 0 else None)
-                train_logger.info(f"[rank {rank}] pre_train_ds_cycle: xm.remdevous start.") 
+                train_logger.debug(f"[rank {rank}] pre_train_ds_cycle: xm.remdevous start.") 
                 payload_list = xm.rendezvous('pre_train_ds_cycle_paths', payload)
-                train_logger.info(f"[rank {rank}] pre_train_ds_cycle: pickle load start.") 
+                train_logger.debug(f"[rank {rank}] pre_train_ds_cycle: pickle load start.") 
                 remaining_sgf_files = pickle.loads(payload_list[0])
-                train_logger.info(f"[rank {rank}] pre_train_ds_cycle: broadcast via rendezvous")
+                train_logger.debug(f"[rank {rank}] pre_train_ds_cycle: broadcast via rendezvous")
                 FORCE_RELOAD = False
             else:
                 # 通常の分散環境では dist.broadcast_object_list を使用
@@ -113,8 +113,6 @@ def prepare_train_dataset_cycle(sgf_dir, board_size, history_length, resume_flag
     train_logger.info(f"[rank {rank}] pre_train_ds_cycle: assigned {len(files_to_process)} files.")
 
     all_samples = []
-
-    train_logger.debug(f"[rank {rank}] pre_train_ds_cycle:(6)")
 
     # ファイルを1件ずつ処理し、処理後すぐにチェックポイントを更新
     for sgf_file in files_to_process:

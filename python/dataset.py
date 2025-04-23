@@ -537,7 +537,7 @@ def prepare_test_dataset(sgf_dir, board_size, history_length, augment_all, outpu
     ・生成したサンプルはpickle形式で保存する
     """
     if os.path.exists(output_file):
-        train_logger.debug(f"Test dataset pickle {output_file} already exists. Loading it directly...")
+        train_logger.info(f"Test dataset pickle {output_file} already exists. Loading it directly...")
         return load_dataset(output_file)
 
     if not os.path.exists(TEST_SGFS_ZIP):
