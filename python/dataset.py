@@ -429,6 +429,7 @@ def validate_model(model, test_loader, device):
 
     policy_accuracy = total_correct / total_samples_count
     train_logger.info(f"===== Validation Policy Accuracy ==== 【{policy_accuracy:.5f}】")
+
     return policy_accuracy
 
 # ==============================

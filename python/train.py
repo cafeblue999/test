@@ -27,7 +27,7 @@ from dataset import (
     process_sgf_to_samples_from_text
 )
 
-from config import USE_TPU, TRAIN_SGF_DIR, VAL_SGF_DIR, INFERENCE_MODEL_PREFIX, CHECKPOINT_FILE, bar_fmt, get_logger
+from config import PREFIX, USE_TPU, FORCE_RELOAD, TRAIN_SGF_DIR, VAL_SGF_DIR, MODEL_OUTPUT_DIR, INFERENCE_MODEL_PREFIX, CHECKPOINT_FILE, PROGRESS_CHECKPOINT_FILE, bar_fmt, get_logger
 
 from utils import BOARD_SIZE, HISTORY_LENGTH, NUM_CHANNELS, num_residual_blocks, model_channels, batch_size, learning_rate, patience, factor, number_max_files, CONFIG_PATH
 
@@ -35,6 +35,8 @@ train_logger = get_logger()
 
 # グローバル変数（未処理のSGFファイルリスト）
 remaining_sgf_files = []
+# 全SGFファイル数（初回サイクル時に記録）
+TOTAL_SGF_FILES = None
 
 def prepare_train_dataset_cycle(sgf_dir, board_size, history_length, resume_flag, augment_all, max_files, rank=0, nprocs=1):
     """
@@ -45,7 +47,7 @@ def prepare_train_dataset_cycle(sgf_dir, board_size, history_length, resume_flag
     ・ファイル全体をランダムな順序に並べ替え、max_files 件分だけ処理する。
     ・処理後、残りファイルリストの進捗を保存する。
     """
-    global remaining_sgf_files, FORCE_RELOAD
+    global remaining_sgf_files, FORCE_RELOAD, TOTAL_SGF_FILES
 
     # resume_flag が True かつ FORCE_RELOAD が False の場合のみ、進捗チェックポイントからロード
     if resume_flag and not FORCE_RELOAD:
@@ -69,6 +71,8 @@ def prepare_train_dataset_cycle(sgf_dir, board_size, history_length, resume_flag
 
             random.shuffle(all_files)
             remaining_sgf_files = all_files
+            # 初回サイクル時に全ファイル数を記録
+            TOTAL_SGF_FILES = len(all_files)
             
             train_logger.info(f"[rank {rank}] pre_train_ds_cycle:Regenerated the random order of all SGF files : {len(all_files)} (FORCE_RELOAD was {FORCE_RELOAD})")
             
@@ -93,20 +97,20 @@ def prepare_train_dataset_cycle(sgf_dir, board_size, history_length, resume_flag
                 dist.broadcast_object_list(buf, src=0)
                 remaining_sgf_files = buf[0]
                 FORCE_RELOAD = False
-
-            train_logger.info(f"[rank {rank}] remaning_sgf_files : {len(remaining_sgf_files)}")
     
     # 今回処理するファイルリストを取り出す（max_files 件まで）
     if len(remaining_sgf_files) < max_files:
         files_to_process = remaining_sgf_files.copy()
     else:
         files_to_process = remaining_sgf_files[:max_files]
-    
-    train_logger.debug(f"[rank {rank}] pre_train_ds_cycle:(5)")
+
+    # 毎サイクル、残り/全体 をログ出力
+    if TOTAL_SGF_FILES is not None:
+        train_logger.info(f"[rank {rank}] pre_train_ds_cycle: remaining {len(remaining_sgf_files)}/{TOTAL_SGF_FILES} files")
     
     # 各 rank に応じてデータを分割（全体の1/nprocsを担当）
     files_to_process = files_to_process[rank::nprocs]
-    train_logger.info(f"[rank {rank}] pre_train_ds_cycle:[rank {rank}] assigned {len(files_to_process)} files.")
+    train_logger.info(f"[rank {rank}] pre_train_ds_cycle: assigned {len(files_to_process)} files.")
 
     all_samples = []
 
@@ -413,7 +417,7 @@ def _mp_fn(rank):
             # optimizer から復元された現在の学習率を取得
             if ordinal == 0:
                 # ■■■ lrを変更 ■■■
-                optimizer.param_groups[0]['lr'] = 0.0001
+                # optimizer.param_groups[0]['lr'] = 0.0001
 
                 current_lr = optimizer.param_groups[0]["lr"]
                 train_logger.info(f"[rank {rank}] =========== params ============")
@@ -437,8 +441,7 @@ def _mp_fn(rank):
 
             if ordinal == 0:
                 train_logger.info(
-                    f"[rank {rank}] _mp_fn:Initial best_policy_accuracy: {best_policy_accuracy:.5f}, "
-                    f"[rank {rank}] _mp_fn:resume at epoch={resume_epoch}, batch={resume_batch_idx}"
+                    f"[rank {rank}] _mp_fn:Initial best_policy_accuracy: {best_policy_accuracy:.5f}, resume at epoch={resume_epoch}, batch={resume_batch_idx}"
                 )
 
             # データセットを同期的にロード
@@ -488,8 +491,7 @@ def _mp_fn(rank):
 
             if ordinal == 0:
                 train_logger.info(
-                    f"[rank {rank}] _mp_fn:Epoch {epoch} - Before scheduler.step(): "
-                    f"[rank {rank}] _mp_fn:lr = {optimizer.param_groups[0]['lr']:.8f}"
+                    f"[rank {rank}] _mp_fn:Epoch {epoch} - Before scheduler.step(): lr = {optimizer.param_groups[0]['lr']:.8f}"
                 )
             
             if ordinal == 0:
@@ -497,9 +499,9 @@ def _mp_fn(rank):
             
             if ordinal == 0:
                 train_logger.info(
-                    f"[rank {rank}] _mp_fn:Epoch {epoch} - After  scheduler.step(): "
-                    f"[rank {rank}] _mp_fn:lr = {optimizer.param_groups[0]['lr']:.8f}"
+                    f"[rank {rank}] _mp_fn:Epoch {epoch} - After  scheduler.step(): lr = {optimizer.param_groups[0]['lr']:.8f}"
                 )
+
             if ordinal == 0:
                 # チェックポイント保存
                 save_checkpoint(
@@ -519,10 +521,16 @@ def _mp_fn(rank):
 # ==============================
 # main処理
 # ==============================
-# グローバル変数として強制再読み込みフラグを定義（プログラム起動時のみ True にする）
-FORCE_RELOAD = True
-
 def main():
+    # ── CLI引数から渡された値と適用後のグローバル変数を出力 ──
+    train_logger.info(f"PREFIX: {PREFIX}")
+    train_logger.info(f"FORCE_RELOAD: {FORCE_RELOAD}")
+    train_logger.info(f"TVAL_SGF_DIR {VAL_SGF_DIR}")
+    train_logger.info(f"TRAIN_SGF_DIR {TRAIN_SGF_DIR}")
+    train_logger.info(f"MODEL_OUTPUT_DIR {MODEL_OUTPUT_DIR}")
+    train_logger.info(f"CHECKPOINT_FILE: {CHECKPOINT_FILE}")
+    train_logger.info(f"PROGRESS_CHECKPOINT_FILE: {PROGRESS_CHECKPOINT_FILE}")
+
     # ここに各種初期化、設定ロード、ロガー設定など
     if USE_TPU:
         import torch_xla.distributed.xla_multiprocessing as xmp

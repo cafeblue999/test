@@ -2,20 +2,41 @@
 # 必要なライブラリのインポート
 # ------------------------------
 import os
+import argparse
 from tqdm import tqdm             # 進捗表示用ライブラリ（ループの状況を視覚的に表示）
 import torch.distributed as dist    # 分散学習に必要なモジュール
 import time                         # 時間計測・待機処理に利用
 from datetime import datetime, timedelta, timezone
+
+## コマンドライン引数で PREFIX を設定（config.py で利用）
+parser = argparse.ArgumentParser(add_help=False)
+parser.add_argument("--prefix", type=str, help="SGFディレクトリ／ファイル名のPREFIX")
+parser.add_argument(
+    "--force_reload",
+    type=str,
+    choices=["True", "False"],
+    default="True",
+    help="初回サイクル時に全ファイル再読み込みを行うか ('True' or 'False')"
+)
+args, _ = parser.parse_known_args()
+if args.prefix:
+    os.environ["PREFIX"] = args.prefix
+force_reload_flag = (args.force_reload == "True")
 
 # ===== 固定定義：環境切り替え用フラグ =====
 # TPUやGoogle Colab環境で動作させるかどうかのフラグ。環境に応じた挙動を切り替える
 USE_TPU = True      # TPU を利用する場合は True にする
 USE_COLAB = True    # Google Colab 環境で実行する場合は True にする
 
+# グローバル変数として強制再読み込みフラグを定義（プログラム起動時のみ True にする）
+FORCE_RELOAD = force_reload_flag
+
 # ==============================
 # ディレクトリ設定
 # ==============================
+# ディレクトリ設定（PREFIX は環境変数から取得）
 PREFIX = "ALL"
+PREFIX = os.environ.get("PREFIX", PREFIX)
 
 if USE_COLAB:
     # Google Colab環境向けのディレクトリ設定。Google Drive内の特定のフォルダを利用する

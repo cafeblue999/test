@@ -10,4 +10,5 @@ sys.path.insert(0, '/content/drive/My Drive/sgf/python')
 %cd /content/drive/My Drive/sgf/python
 
 # 4) train.py を実行（必要に応じて引数を追加してください）
-!python train.py
+!python train.py --prefix 3 --force_reload True
+
