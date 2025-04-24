@@ -106,7 +106,9 @@ def prepare_train_dataset_cycle(sgf_dir, board_size, history_length, resume_flag
 
     # 毎サイクル、残り/全体 をログ出力
     if TOTAL_SGF_FILES is not None:
-        train_logger.info(f"[rank {rank}] pre_train_ds_cycle: remaining {len(remaining_sgf_files)}/{TOTAL_SGF_FILES} files")
+        rem = len(remaining_sgf_files)
+        total = TOTAL_SGF_FILES
+        train_logger.info(f"[rank {rank}] pre_train_ds_cycle: remaining: {rem}/{total}")
     
     # 各 rank に応じてデータを分割（全体の1/nprocsを担当）
     files_to_process = files_to_process[rank::nprocs]
@@ -523,7 +525,7 @@ def main():
     # ── CLI引数から渡された値と適用後のグローバル変数を出力 ──
     train_logger.info(f"PREFIX: {PREFIX}")
     train_logger.info(f"FORCE_RELOAD: {FORCE_RELOAD}")
-    train_logger.info(f"TVAL_SGF_DIR {VAL_SGF_DIR}")
+    train_logger.info(f"VAL_SGF_DIR {VAL_SGF_DIR}")
     train_logger.info(f"TRAIN_SGF_DIR {TRAIN_SGF_DIR}")
     train_logger.info(f"MODEL_OUTPUT_DIR {MODEL_OUTPUT_DIR}")
     train_logger.info(f"CHECKPOINT_FILE: {CHECKPOINT_FILE}")
