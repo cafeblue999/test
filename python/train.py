@@ -339,23 +339,6 @@ def _mp_fn(rank):
         world_size = 1
         train_logger.info(f"[rank {rank}] _mp_fn: Running on device: {device} | rank = {ordinal}, world_size = {world_size}")
 
-    # ログ用に ordinal を設定
-    # train_logger.rank     = ordinal
-    # train_logger.rank       = ordinal
-    # train_logger.is_rank0 = (ordinal == 0)
-    # train_logger.is_rank0   = (ordinal == 0)
-
-    # モデルとオプティマイザ・スケジューラを構築
-    model = EnhancedResNetPolicyValueNetwork(
-        BOARD_SIZE, model_channels, num_residual_blocks, NUM_CHANNELS
-    ).to(device)
-    train_logger.debug(f"[rank {rank}] _mp_fn:model instance to {device}")
-
-    optimizer = optim.Adam(model.parameters(), lr=learning_rate)
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode='max', patience=patience, factor=factor
-    )
-
     # アプリケーション開始ログを rank0 のみ出力
     if rank == 0:
         train_logger.info(f"[rank {rank}] === Starting Training and Validation Loop ===")
@@ -375,15 +358,16 @@ def _mp_fn(rank):
         train_logger.info(f"[rank {rank}] ===============================")
 
     # テストデータ準備
-    test_dataset_pickle = os.path.join(VAL_SGF_DIR, "test_dataset.pkl")
-    test_samples = prepare_test_dataset(
+    if rank == 0:
+        test_dataset_pickle = os.path.join(VAL_SGF_DIR, "test_dataset.pkl")
+        test_samples = prepare_test_dataset(
         VAL_SGF_DIR, BOARD_SIZE, HISTORY_LENGTH, True, test_dataset_pickle
-    )
-    test_loader = DataLoader(
-        AlphaZeroSGFDatasetPreloaded(test_samples),
-        batch_size=batch_size, shuffle=False
-    )
-    train_logger.debug(f"[rank {rank}] _mp_fn:test_loader end.")
+        )
+        test_loader = DataLoader(
+            AlphaZeroSGFDatasetPreloaded(test_samples),
+            batch_size=batch_size, shuffle=False
+        )
+        train_logger.debug(f"[rank {rank}] _mp_fn:test_loader end.")
 
     resume_epoch, resume_batch_idx = 0, -1
     mid_epoch_resumed = False
@@ -391,7 +375,18 @@ def _mp_fn(rank):
 
     try:
         while True:
-            # ── SGFファイルを number_max_files 件ずつ読み込み（重複なくサイクル） ──
+            # モデルとオプティマイザ・スケジューラを構築
+            model = EnhancedResNetPolicyValueNetwork(
+                BOARD_SIZE, model_channels, num_residual_blocks, NUM_CHANNELS
+            ).to(device)
+            train_logger.debug(f"[rank {rank}] _mp_fn:model instance to {device}")
+
+            optimizer = optim.Adam(model.parameters(), lr=learning_rate)
+            scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+                optimizer, mode='max', patience=patience, factor=factor
+                ) 
+            
+            # SGFファイルを number_max_files 件ずつ読み込み（重複なくサイクル）
             samples = prepare_train_dataset_cycle(
                 TRAIN_SGF_DIR, BOARD_SIZE, HISTORY_LENGTH,
                 resume_flag, augment_all=True,
@@ -408,11 +403,13 @@ def _mp_fn(rank):
             resume_epoch, best_policy_accuracy, resume_batch_idx, loaded_seed = load_checkpoint(
                 model, optimizer, scheduler, CHECKPOINT_FILE, device
             )
-
+            # モデルを改めてXLAデバイスに配置（復元後）
+            model.to(device) 
+            
             # optimizer から復元された現在の学習率を取得
             if ordinal == 0:
                 # ■■■ lrを変更 ■■■
-                # optimizer.param_groups[0]['lr'] = 0.0001
+                #optimizer.param_groups[0]['lr'] = 0.000005
 
                 current_lr = optimizer.param_groups[0]["lr"]
                 train_logger.info(f"[rank {rank}] =========== params ============")
@@ -484,20 +481,14 @@ def _mp_fn(rank):
                 else:
                     save_inference_model(model, device, f"{INFERENCE_MODEL_PREFIX}_tmp.pt")
 
-            if ordinal == 0:
                 train_logger.info(
                     f"[rank {rank}] _mp_fn:Epoch {epoch} - Before scheduler.step(): lr = {optimizer.param_groups[0]['lr']:.8f}"
                 )
-            
-            if ordinal == 0:
                 scheduler.step(policy_accuracy)
-            
-            if ordinal == 0:
                 train_logger.info(
                     f"[rank {rank}] _mp_fn:Epoch {epoch} - After  scheduler.step(): lr = {optimizer.param_groups[0]['lr']:.8f}"
                 )
 
-            if ordinal == 0:
                 # チェックポイント保存
                 save_checkpoint(
                     model, optimizer, scheduler, epoch + 1,
@@ -506,7 +497,6 @@ def _mp_fn(rank):
                     batch_idx=last_batch_idx,
                     base_seed=base_seed
                 )
-            if ordinal == 0:
                 train_logger.info(f"[rank {rank}] _mp_fn:Iteration completed. Restarting next iteration...\n")
             
             epoch += 1
