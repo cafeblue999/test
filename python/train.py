@@ -233,7 +233,6 @@ def train_one_iteration(model, train_loader, optimizer, scheduler, device,
         loss.backward()
         if USE_TPU:
             # TPUの場合、勾配を同期してパラメータ更新
-            import torch_xla.core.xla_model as xm
             xm.optimizer_step(optimizer, barrier=True)
         else:
             # GPU/CPU環境では通常の更新
@@ -328,8 +327,6 @@ def _mp_fn(rank):
     # デバイス初期化
     # デバイス初期化（ordinal = XLA 上の実プロセス番号）
     if USE_TPU:
-        import torch_xla.core.xla_model as xm
-        import torch.distributed as dist
         device     = xm.xla_device()
         ordinal    = xm.get_ordinal()
         world_size = xm.xrt_world_size()
@@ -347,6 +344,17 @@ def _mp_fn(rank):
     # train_logger.rank       = ordinal
     # train_logger.is_rank0 = (ordinal == 0)
     # train_logger.is_rank0   = (ordinal == 0)
+
+    # モデルとオプティマイザ・スケジューラを構築
+    model = EnhancedResNetPolicyValueNetwork(
+        BOARD_SIZE, model_channels, num_residual_blocks, NUM_CHANNELS
+    ).to(device)
+    train_logger.debug(f"[rank {rank}] _mp_fn:model instance to {device}")
+
+    optimizer = optim.Adam(model.parameters(), lr=learning_rate)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode='max', patience=patience, factor=factor
+    )
 
     # アプリケーション開始ログを rank0 のみ出力
     if rank == 0:
@@ -382,8 +390,6 @@ def _mp_fn(rank):
     epoch, best_policy_accuracy = 0, 0.0
 
     try:
-        import torch_xla.core.xla_model as xm
-
         while True:
             # ── SGFファイルを number_max_files 件ずつ読み込み（重複なくサイクル） ──
             samples = prepare_train_dataset_cycle(
@@ -397,17 +403,6 @@ def _mp_fn(rank):
             # Dataset 化（rank ごとに分割済み）
             training_dataset = AlphaZeroSGFDatasetPreloaded(samples)
             train_logger.info(f"[rank {rank}] _mp_fn: prepared {len(samples)} samples this epoch")
-
-            # モデルとオプティマイザ・スケジューラを構築
-            model = EnhancedResNetPolicyValueNetwork(
-                BOARD_SIZE, model_channels, num_residual_blocks, NUM_CHANNELS
-            ).to(device)
-            train_logger.debug(f"[rank {rank}] _mp_fn:model instance to {device}")
-
-            optimizer = optim.Adam(model.parameters(), lr=learning_rate)
-            scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-                optimizer, mode='max', patience=patience, factor=factor
-            )
 
             # チェックポイント読み込み
             resume_epoch, best_policy_accuracy, resume_batch_idx, loaded_seed = load_checkpoint(
