@@ -26,7 +26,7 @@ from dataset import (
     load_checkpoint
 )
 
-from config import PREFIX, USE_TPU, FORCE_RELOAD, TRAIN_SGF_DIR, VAL_SGF_DIR, MODEL_OUTPUT_DIR, INFERENCE_MODEL_PREFIX, CHECKPOINT_FILE, bar_fmt, get_logger
+from config import PREFIX, USE_TPU, FORCE_RELOAD, TRAIN_SGF_DIR, VAL_SGF_DIR, MODEL_OUTPUT_DIR, INFERENCE_MODEL_PREFIX, CHECKPOINT_FILE, bar_fmt, get_logger, tqdm_kwargs
 
 from utils import BOARD_SIZE, HISTORY_LENGTH, NUM_CHANNELS, num_residual_blocks, model_channels, batch_size, learning_rate, patience, factor, number_max_files, number_proc_files, CONFIG_PATH, val_interval
 
@@ -37,15 +37,16 @@ train_logger = get_logger()
 # ==============================
 def train_one_iteration(
     model, train_loader, optimizer, scheduler, device,
-    epoch, checkpoint_interval, best_policy_accuracy, rank
+    local_loop_cnt, checkpoint_interval, best_policy_accuracy, rank
 ):
     model.train()
     total_loss = total_policy = total_value = total_margin = 0.0
     overall_correct = overall_samples = 0
-    last_checkpoint = time.time()
+    total_batches = len(train_loader)
+    log_interval = max(1, total_batches // 10)  # 10% ごとにログ
 
-    for i, (boards, target_policies, target_values, target_margins) in enumerate(
-            tqdm(train_loader, desc=f"[rank {rank}]", bar_format=bar_fmt)):
+    for i, (boards, target_policies, target_values, target_margins) in enumerate(train_loader, start=1):
+        
         boards = boards.to(device)
         target_policies = target_policies.to(device)
         target_values = target_values.to(device)
@@ -82,21 +83,16 @@ def train_one_iteration(
         overall_correct += (batch_pred == batch_true).sum().item()
         overall_samples += boards.size(0)
 
-        # 定期チェックポイント
-        #if rank == 0 and time.time() - last_checkpoint >= checkpoint_interval:
-        #    save_checkpoint_nolog(
-        #        model, optimizer, scheduler,
-        #        epoch, 0.0, 0, best_policy_accuracy,
-        #        CHECKPOINT_FILE, device,
-        #        batch_idx=i, base_seed=None
-        #    )
-        #    last_checkpoint = time.time()
+        # 進捗ログ
+        if i % log_interval == 0 or i == total_batches:
+            train_logger.info(
+                f"[rank {rank}] Epoch {local_loop_cnt}: processed {i:3d}/{total_batches:3d} batches {i*100/total_batches:3.0f}%)")
 
     # エポック終了ログ
     if rank == 0:
         avg_loss = total_loss / len(train_loader)
         acc = overall_correct / overall_samples
-        train_logger.info(f"[rank {rank}] Epoch {epoch} done. loss={avg_loss:.5f}, acc={acc:.5f}")
+        train_logger.info(f"[rank {rank}] Epoch {local_loop_cnt} done. loss={avg_loss:.5f}, acc={acc:.5f}")
     
     train_logger.debug(f"[rank {rank}] train_one_iteration done. Returning control to _mp_fn")
     
@@ -170,7 +166,7 @@ def _mp_fn(rank):
         model.to(device)   
    
         # epoch と rank を組み合わせたシード
-        base_seed = 12345
+        base_seed = int(time.time_ns() % (2**32))
         random.seed(base_seed + local_loop_cnt * world_size + ordinal)
         
         if rank == 0:
@@ -239,7 +235,7 @@ def _mp_fn(rank):
         # １エポック分の訓練（デバイスローダーを渡す）
         avg_loss = train_one_iteration(
             model, train_device_loader, optimizer, scheduler,
-             device, epoch, checkpoint_interval,
+             device, local_loop_cnt, checkpoint_interval,
              best_policy_accuracy, rank
         )
         train_logger.debug(f"[rank {rank}] train_one_iteration returned, evaluating if validation is needed")

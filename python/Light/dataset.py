@@ -6,7 +6,7 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 from tqdm import tqdm
-from config import get_logger, PREFIX, MODEL_OUTPUT_DIR, INFERENCE_MODEL_PREFIX, bar_fmt, TEST_SGFS_ZIP
+from config import get_logger, PREFIX, MODEL_OUTPUT_DIR, INFERENCE_MODEL_PREFIX, bar_fmt, TEST_SGFS_ZIP, tqdm_kwargs
 from utils  import BOARD_SIZE, NUM_CHANNELS
 
 train_logger = get_logger()
@@ -421,7 +421,7 @@ def validate_model(model, test_loader, device):
     train_logger.info(f"[rank 0] validate_model: started with {len(test_loader)} batches")
 
     with torch.no_grad():  # 評価時は勾配計算を行わない
-        for boards, target_policies, _, _ in tqdm(test_loader, desc="Validation", bar_format=bar_fmt, leave=False, position=0):
+        for boards, target_policies, _, _ in tqdm(test_loader, desc="Validation", bar_format=bar_fmt,  position=0, **tqdm_kwargs):
             boards = boards.to(device)
             target_policies = target_policies.to(device)
             pred_policy, _ = model(boards)

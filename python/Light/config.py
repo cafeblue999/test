@@ -2,6 +2,7 @@
 # 必要なライブラリのインポート
 # ------------------------------
 import os
+import sys
 import argparse
 from tqdm import tqdm             # 進捗表示用ライブラリ（ループの状況を視覚的に表示）
 import time                         # 時間計測・待機処理に利用
@@ -35,7 +36,7 @@ FORCE_RELOAD = force_reload_flag
 # ディレクトリ設定
 # ==============================
 # ディレクトリ設定（PREFIX は環境変数から取得）
-PREFIX = "ALL"
+PREFIX = "3"
 PREFIX = os.environ.get("PREFIX", PREFIX)
 
 if USE_COLAB:
@@ -68,6 +69,7 @@ if not os.path.exists(MODEL_OUTPUT_DIR):
 # ==============================
 # tqdm の表示
 # ==============================
+tqdm_kwargs = dict(file=sys.stdout, leave=True)
 # カスタムフォーマッタを定義（常に hh:mm:ss 形式で出力）
 def fixed_format_interval(seconds):
     return time.strftime('%H:%M:%S', time.gmtime(seconds))
@@ -116,8 +118,8 @@ class FileLogger:
 
         timestamp = datetime.now(JST).strftime("%Y-%m-%d %H:%M:%S")
         log_line = f"{timestamp} {level}:{message}"
-        #print(log_line)  # コンソール出力（rank0以外も見える）
-        tqdm.write(log_line)
+        print(log_line)  # コンソール出力（rank0以外も見える）
+        #tqdm.write(log_line)
         self.log_file.write(log_line + "\n")
         self.log_file.flush()
 
@@ -168,21 +170,11 @@ def get_logger():
         fh.setFormatter(formatter)
         logger.addHandler(fh)
 
-        # --- tqdm.write() 用ハンドラ ---
-        class TqdmLoggingHandler(logging.Handler):
-            def __init__(self, level=logging.NOTSET):
-                super().__init__(level)
-            def emit(self, record):
-                try:
-                    msg = self.format(record)
-                    tqdm.write(msg)
-                except Exception:
-                    self.handleError(record)
-
-        th = TqdmLoggingHandler()
-        th.setLevel(level)
-        th.setFormatter(formatter)
-        logger.addHandler(th)
-
+        # --- コンソール出力用ハンドラ（tqdm.write をやめて通常の StreamHandler を使う） ---
+        sh = logging.StreamHandler(stream=sys.stdout)
+        sh.setLevel(level)
+        sh.setFormatter(formatter)
+        logger.addHandler(sh)
         _logger_instance = logger
+
     return _logger_instance
