@@ -43,6 +43,7 @@ def load_config(config_path):
         # 一回のデータセット生成時に処理するファイル数
         number_max_files = int(config.get("TRAIN", "number_max_files", fallback="256"))
         number_proc_files = int(config.get("TRAIN", "number_proc_files", fallback="64"))
+        val_interval = int(config.get("TRAIN", "val_interval", fallback="1"))
     except Exception as e:
         # 読み込みエラーが発生した場合はエラーログを出力し、プログラムを終了する
         train_logger.error(f"Error reading configuration: {e}")
@@ -62,7 +63,8 @@ def load_config(config_path):
         "patience": patience,
         "factor": factor,
         "number_max_files": number_max_files,
-        "number_proc_files": number_proc_files
+        "number_proc_files": number_proc_files,
+        "val_interval": val_interval
     }
 
 # 設定ファイルのパス（BASE_DIR配下にあると仮定）
@@ -84,5 +86,6 @@ patience = config_params["patience"]
 factor = config_params["factor"]
 number_max_files = config_params["number_max_files"]
 number_proc_files = config_params["number_proc_files"]
+val_interval = config_params["val_interval"]
 
 
