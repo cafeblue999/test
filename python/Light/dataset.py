@@ -421,7 +421,7 @@ def validate_model(model, test_loader, device):
     train_logger.info(f"[rank 0] validate_model: started with {len(test_loader)} batches")
 
     with torch.no_grad():  # 評価時は勾配計算を行わない
-        for boards, target_policies, _, _ in tqdm(test_loader, desc="Validation", bar_format=bar_fmt, miniters=10, mininterval=3600, dynamic_miniters=False, leave=False, dynamic_ncols=True, position=0):
+        for boards, target_policies, _, _ in tqdm(test_loader, desc="Validation", bar_format=bar_fmt, leave=False, position=0):
             boards = boards.to(device)
             target_policies = target_policies.to(device)
             pred_policy, _ = model(boards)

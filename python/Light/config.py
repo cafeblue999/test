@@ -161,7 +161,7 @@ def get_logger():
         # --- ファイルへの出力ハンドラ ---
         fh = logging.FileHandler(LOG_FILE_PATH, encoding="utf-8")
         fh.setLevel(level)
-        fmt = '%(asctime)s [%(levelname)s] %(name)s: %(message)s'
+        fmt = '%(asctime)s [%(levelname)s] %(message)s'
         datefmt = '%Y-%m-%d %H:%M:%S'
         formatter = logging.Formatter(fmt, datefmt=datefmt)
         fh.setFormatter(formatter)
