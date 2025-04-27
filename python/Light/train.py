@@ -83,14 +83,14 @@ def train_one_iteration(
         overall_samples += boards.size(0)
 
         # 定期チェックポイント
-        if rank == 0 and time.time() - last_checkpoint >= checkpoint_interval:
-            save_checkpoint_nolog(
-                model, optimizer, scheduler,
-                epoch, 0.0, 0, best_policy_accuracy,
-                CHECKPOINT_FILE, device,
-                batch_idx=i, base_seed=None
-            )
-            last_checkpoint = time.time()
+        #if rank == 0 and time.time() - last_checkpoint >= checkpoint_interval:
+        #    save_checkpoint_nolog(
+        #        model, optimizer, scheduler,
+        #        epoch, 0.0, 0, best_policy_accuracy,
+        #        CHECKPOINT_FILE, device,
+        #        batch_idx=i, base_seed=None
+        #    )
+        #    last_checkpoint = time.time()
 
     # エポック終了ログ
     if rank == 0:
@@ -148,6 +148,8 @@ def _mp_fn(rank):
     ]
     train_logger.info(f"[rank {rank}] Available {len(all_files)} SGF files (shared across all ranks)")
     
+    local_loop_cnt = 0
+
     while True:
         # モデル／オプティマイザ／スケジューラ生成
         model = EnhancedResNetPolicyValueNetwork(
@@ -169,12 +171,12 @@ def _mp_fn(rank):
    
         # epoch と rank を組み合わせたシード
         base_seed = 12345
-        random.seed(base_seed + epoch * world_size + ordinal)
+        random.seed(base_seed + local_loop_cnt * world_size + ordinal)
         
         if rank == 0:
             current_lr = optimizer.param_groups[0]["lr"]
             train_logger.info(f"[rank {rank}] =========== params ============")
-            train_logger.info(f"[rank {rank}] epoch: {epoch}")
+            train_logger.info(f"[rank {rank}] epoch: {local_loop_cnt}")
             train_logger.info(f"[rank {rank}] learning_rate (from optimizer): {current_lr:.8f}")
             train_logger.info(f"[rank {rank}] patience: {patience}")
             train_logger.info(f"[rank {rank}] factor: {factor}")
@@ -188,7 +190,7 @@ def _mp_fn(rank):
             selected = random.sample(all_files, k=number_max_files)
         else:
             selected = random.choices(all_files, k=number_max_files)
-        train_logger.info(f"[rank {rank}] Epoch {epoch}: sampled {len(selected)} files (random from shared)")
+        train_logger.info(f"[rank {rank}] Epoch {local_loop_cnt}: sampled {len(selected)} files (random from shared)")
 
         # SGF→サンプル生成
         samples = []
@@ -202,8 +204,8 @@ def _mp_fn(rank):
             except Exception as e:
                 train_logger.error(f"[rank {rank}] Error processing {sgf_file}: {e}")
         if len(samples) == 0:
-            train_logger.warning(f"[rank {rank}] No samples generated. Skipping epoch {epoch}.")
-            epoch += 1
+            train_logger.warning(f"[rank {rank}] No samples generated. Skipping epoch {local_loop_cnt}.")
+            local_loop_cnt += 1
             continue
 
         #  DistributedSampler を使った DataLoader 組み立て
@@ -216,8 +218,9 @@ def _mp_fn(rank):
             shuffle=True,
             drop_last=True
         )
+
         # エポックごとにシードを変える
-        train_sampler.set_epoch(epoch)
+        train_sampler.set_epoch(local_loop_cnt)
 
         train_loader = DataLoader(
             train_dataset,
@@ -228,7 +231,7 @@ def _mp_fn(rank):
             prefetch_factor=1,
             persistent_workers=False
         )
-        train_logger.info(f"[rank {rank}] Epoch {epoch}: {len(train_loader)} batches")
+        train_logger.info(f"[rank {rank}] Epoch {local_loop_cnt}: {len(train_loader)} batches")
 
         # TPU 向けにデバイスローダーを作成
         train_device_loader = MpDeviceLoader(train_loader, device)
@@ -241,11 +244,11 @@ def _mp_fn(rank):
         )
         train_logger.debug(f"[rank {rank}] train_one_iteration returned, evaluating if validation is needed")
 
-        epoch += 1
+        local_loop_cnt += 1
 
         # 検証とモデル保存（ordinal=0 のみ）
-        if ordinal == 0 and (epoch + 1) % val_interval == 0:
-            train_logger.info(f"[rank {rank}] Starting validation after epoch {epoch}")
+        if ordinal == 0 and local_loop_cnt % val_interval == 0:
+            train_logger.info(f"[rank {rank}] Starting validation after epoch {local_loop_cnt}")
             model.eval()  # ドロップアウトや BN を評価モードに
             # グラフを保持せずに検証を実行
             with torch.no_grad():
@@ -269,11 +272,10 @@ def _mp_fn(rank):
             after_lr = optimizer.param_groups[0]["lr"]
             train_logger.info(f"[rank {rank}] _mp_fn: After  scheduler.step(): learning rate = {after_lr:.8f}")
 
-        if ordinal == 0:
             # チェックポイント保存
             save_checkpoint(
                 model, optimizer, scheduler,
-                epoch,      # 次の epoch 用に +1
+                local_loop_cnt,        # epoch 保存
                 0.0,                   # val_loss は使用せず
                 0,                     # epochs_no_improve は使用せず
                 best_policy_accuracy,
@@ -281,7 +283,7 @@ def _mp_fn(rank):
                 batch_idx=-1,          # バッチ再開なし
                 base_seed=None
             )
-            train_logger.info(f"[rank {rank}] Epoch {epoch} completed. best_acc={best_policy_accuracy:.5f}")
+            train_logger.info(f"[rank {rank}] Epoch {local_loop_cnt} completed. best_acc={best_policy_accuracy:.5f}")
 
         del model, optimizer, scheduler, samples, train_dataset, train_loader, train_device_loader
         gc.collect()

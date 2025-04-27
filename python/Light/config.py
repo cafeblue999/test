@@ -6,6 +6,7 @@ import argparse
 from tqdm import tqdm             # 進捗表示用ライブラリ（ループの状況を視覚的に表示）
 import time                         # 時間計測・待機処理に利用
 from datetime import datetime, timedelta, timezone
+import logging
 
 ## コマンドライン引数で PREFIX を設定（config.py で利用）
 parser = argparse.ArgumentParser(add_help=False)
@@ -115,7 +116,8 @@ class FileLogger:
 
         timestamp = datetime.now(JST).strftime("%Y-%m-%d %H:%M:%S")
         log_line = f"{timestamp} {level}:{message}"
-        print(log_line)  # コンソール出力（rank0以外も見える）
+        #print(log_line)  # コンソール出力（rank0以外も見える）
+        tqdm.write(log_line)
         self.log_file.write(log_line + "\n")
         self.log_file.flush()
 
@@ -133,7 +135,6 @@ class FileLogger:
 # ==============================
 # シングルトンとして取得する関数
 # ==============================
-
 # グローバルに 1 インスタンスだけ保持
 _logger_instance = None
 
@@ -145,6 +146,42 @@ def get_logger():
     """
     global _logger_instance
     if _logger_instance is None:
-        _logger_instance = FileLogger()
-    return _logger_instance
+   #     _logger_instance = FileLogger()
+   # return _logger_instance
+        # Python 標準 logging.Logger を生成・設定
+        logger = logging.getLogger("")
+        # 既存のハンドラをクリアし、親ロガーへの伝播も無効化（重複出力防止）
+        logger.handlers.clear()
+        logger.propagate = False
 
+        # 環境変数から取得した LOG_LEVEL（文字列）を数値レベルに変換
+        level = getattr(logging, LOG_LEVEL, logging.INFO)
+        logger.setLevel(level)
+
+        # --- ファイルへの出力ハンドラ ---
+        fh = logging.FileHandler(LOG_FILE_PATH, encoding="utf-8")
+        fh.setLevel(level)
+        fmt = '%(asctime)s [%(levelname)s] %(name)s: %(message)s'
+        datefmt = '%Y-%m-%d %H:%M:%S'
+        formatter = logging.Formatter(fmt, datefmt=datefmt)
+        fh.setFormatter(formatter)
+        logger.addHandler(fh)
+
+        # --- tqdm.write() 用ハンドラ ---
+        class TqdmLoggingHandler(logging.Handler):
+            def __init__(self, level=logging.NOTSET):
+                super().__init__(level)
+            def emit(self, record):
+                try:
+                    msg = self.format(record)
+                    tqdm.write(msg)
+                except Exception:
+                    self.handleError(record)
+
+        th = TqdmLoggingHandler()
+        th.setLevel(level)
+        th.setFormatter(formatter)
+        logger.addHandler(th)
+
+        _logger_instance = logger
+    return _logger_instance
