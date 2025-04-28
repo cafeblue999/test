@@ -28,7 +28,10 @@ from dataset import (
 
 from config import PREFIX, USE_TPU, FORCE_RELOAD, TRAIN_SGF_DIR, VAL_SGF_DIR, MODEL_OUTPUT_DIR, INFERENCE_MODEL_PREFIX, CHECKPOINT_FILE, bar_fmt, get_logger, tqdm_kwargs
 
-from utils import BOARD_SIZE, HISTORY_LENGTH, NUM_CHANNELS, num_residual_blocks, model_channels, batch_size, learning_rate, patience, factor, number_max_files, number_proc_files, CONFIG_PATH, val_interval
+from utils import BOARD_SIZE, HISTORY_LENGTH, NUM_CHANNELS, num_residual_blocks, model_channels, batch_size, learning_rate, patience, factor, number_max_files, number_proc_files, CONFIG_PATH, val_interval, w_policy_loss, w_value_loss, w_margin_loss
+
+import torch.multiprocessing as mp
+mp.set_sharing_strategy('file_system')
 
 train_logger = get_logger()
 
@@ -40,6 +43,7 @@ def train_one_iteration(
     local_loop_cnt, checkpoint_interval, best_policy_accuracy, rank
 ):
     model.train()
+
     total_loss = total_policy = total_value = total_margin = 0.0
     overall_correct = overall_samples = 0
     total_batches = len(train_loader)
@@ -57,7 +61,7 @@ def train_one_iteration(
         policy_loss = -torch.sum(target_policies * pred_policy) / boards.size(0)
         value_loss  = F.mse_loss(pred_value.view(-1), target_values.view(-1))
         margin_loss = F.mse_loss(pred_margin.view(-1), target_margins.view(-1))
-        loss = policy_loss + 0.05 * value_loss + 0.0001 * margin_loss
+        loss = w_policy_loss * policy_loss + w_value_loss * value_loss + w_margin_loss * margin_loss
 
         if not torch.isfinite(loss):
             train_logger.error(f"[rank {rank}] Invalid loss: {loss}. Skipping this batch.")
@@ -92,9 +96,7 @@ def train_one_iteration(
     if rank == 0:
         avg_loss = total_loss / len(train_loader)
         acc = overall_correct / overall_samples
-        train_logger.info(f"[rank {rank}] Epoch {local_loop_cnt} done. loss={avg_loss:.5f}, acc={acc:.5f}")
-    
-    train_logger.debug(f"[rank {rank}] train_one_iteration done. Returning control to _mp_fn")
+        train_logger.info(f"[rank {rank}] Epoch {local_loop_cnt} iteration done. loss={avg_loss:.5f}, acc={acc:.5f}")
     
     return total_loss / len(train_loader)
 
@@ -181,56 +183,48 @@ def _mp_fn(rank):
             train_logger.info(f"[rank {rank}] number_max_files: {number_max_files}")
             train_logger.info(f"[rank {rank}] best_policy_accuracy (from checkpoint): {best_policy_accuracy:.5f}")
             train_logger.info(f"[rank {rank}] val_interval: {val_interval}")
+            train_logger.info(f"[rank {rank}] w_policy_loss: {w_policy_loss}")
+            train_logger.info(f"[rank {rank}] w_value_loss: {w_value_loss}")
+            train_logger.info(f"[rank {rank}] w_value_loss: {w_margin_loss}")
             train_logger.info(f"[rank {rank}] ===============================")
         
-        # 各 epoch ごとにランダムに sampling（全rank共通リストから）
+        # ① 全rank共通でnumber_max_filesファイルを全SGFファイルより選択
         if len(all_files) >= number_max_files:
-            selected = random.sample(all_files, k=number_max_files)
+            all_selected = random.sample(all_files, k=number_max_files)
         else:
-            selected = random.choices(all_files, k=number_max_files)
-        train_logger.info(f"[rank {rank}] Epoch {local_loop_cnt}: sampled {len(selected)} files (random from shared)")
+            all_selected = random.choices(all_files, k=number_max_files)
+
+        # ② 各rankはその中のスライスだけ処理（チャンク分割）
+        selected = all_selected[ordinal::world_size]
+
+        train_logger.info(f"[rank {rank}] Epoch {local_loop_cnt}: sampled {len(selected)} files")
 
         # SGF→サンプル生成
         samples = []
         for sgf_file in selected:
-            try:
-                with open(sgf_file, "r", encoding="utf-8") as f:
-                    sgf_src = f.read()
-                samples.extend(process_sgf_to_samples_from_text(
-                    sgf_src, BOARD_SIZE, HISTORY_LENGTH, augment_all=True
-                ))
-            except Exception as e:
-                train_logger.error(f"[rank {rank}] Error processing {sgf_file}: {e}")
-        if len(samples) == 0:
+            with open(sgf_file, "r", encoding="utf-8") as f:
+                sgf_src = f.read()
+            samples.extend(process_sgf_to_samples_from_text(
+                sgf_src, BOARD_SIZE, HISTORY_LENGTH, augment_all=True
+            ))
+        if not samples:
             train_logger.warning(f"[rank {rank}] No samples generated. Skipping epoch {local_loop_cnt}.")
             local_loop_cnt += 1
             continue
 
-        #  DistributedSampler を使った DataLoader 組み立て
+        # ③ サンプルリストをそのまま Dataset に
         train_dataset = AlphaZeroSGFDatasetPreloaded(samples)
 
-        train_sampler = DistributedSampler(
-            train_dataset,
-            num_replicas=world_size,
-            rank=ordinal,
-            shuffle=True,
-            seed=seed,
-            drop_last=True
-        )
-
-        # エポックごとにシードを変える
-        train_sampler.set_epoch(local_loop_cnt)
-
+        # ④ DistributedSampler は使わずに、DataLoader の shuffle だけでランダム化
         train_loader = DataLoader(
             train_dataset,
             batch_size=batch_size,
-            sampler=train_sampler,
+            shuffle=True,               # ← ここだけで十分
             drop_last=True,
             num_workers=1,
             prefetch_factor=1,
             persistent_workers=False
         )
-        train_logger.info(f"[rank {rank}] Epoch {local_loop_cnt}: {len(train_loader)} batches")
 
         # TPU 向けにデバイスローダーを作成
         train_device_loader = MpDeviceLoader(train_loader, device)
@@ -241,19 +235,17 @@ def _mp_fn(rank):
              device, local_loop_cnt, checkpoint_interval,
              best_policy_accuracy, rank
         )
-        train_logger.debug(f"[rank {rank}] train_one_iteration returned, evaluating if validation is needed")
+        train_logger.debug(f"[rank {rank}] train_one_iteration end, avg_loss: {avg_loss:0.5f}")
 
         local_loop_cnt += 1
 
         # 検証とモデル保存（ordinal=0 のみ）
         if ordinal == 0 and local_loop_cnt % val_interval == 0:
             train_logger.info(f"[rank {rank}] Starting validation after epoch {local_loop_cnt}")
-            model.eval()  # ドロップアウトや BN を評価モードに
-            # グラフを保持せずに検証を実行
+            
+            # 検証を実行
             with torch.no_grad():
-                policy_accuracy = validate_model(model, test_loader, device)
-            # 一時変数解放
-            model.train()
+                policy_accuracy, value_mse, margin_mse = validate_model(model, test_loader, device)
 
             if policy_accuracy > best_policy_accuracy:
                 best_policy_accuracy = save_best_model(
@@ -299,6 +291,15 @@ def main():
     train_logger.info(f"TRAIN_SGF_DIR {TRAIN_SGF_DIR}")
     train_logger.info(f"MODEL_OUTPUT_DIR {MODEL_OUTPUT_DIR}")
     train_logger.info(f"CHECKPOINT_FILE: {CHECKPOINT_FILE}")
+    train_logger.info(f"=========== ini ============")
+    train_logger.info(f"patience: {patience}")
+    train_logger.info(f"factor: {factor}")
+    train_logger.info(f"number_max_files: {number_max_files}")
+    train_logger.info(f"val_interval: {val_interval}")
+    train_logger.info(f"w_policy_loss: {w_policy_loss}")
+    train_logger.info(f"w_value_loss: {w_value_loss}")
+    train_logger.info(f"w_value_loss: {w_margin_loss}")
+    train_logger.info(f"===============================")
 
     # ここに各種初期化、設定ロード、ロガー設定など
     if USE_TPU:
