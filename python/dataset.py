@@ -1,12 +1,15 @@
 import os
 import re
+import time
 import pickle
 import zipfile
 import numpy as np
 import torch
+import torch_xla.core.xla_model as xm
+from torch_xla.distributed.parallel_loader import MpDeviceLoader
 from torch.utils.data import Dataset
 from tqdm import tqdm
-from config import TEST_SGFS_ZIP, MODEL_OUTPUT_DIR, bar_fmt, PREFIX, INFERENCE_MODEL_PREFIX, PROGRESS_CHECKPOINT_FILE, get_logger
+from config import get_logger, PREFIX, MODEL_OUTPUT_DIR, INFERENCE_MODEL_PREFIX, bar_fmt, TEST_SGFS_ZIP, tqdm_kwargs
 from utils  import BOARD_SIZE, NUM_CHANNELS
 
 train_logger = get_logger()
@@ -411,26 +414,69 @@ def validate_model(model, test_loader, device):
     """
     テスト用データセットを用いて、モデルのpolicy accuracyを計算する関数。
     各バッチごとに予測とターゲットの最大値インデックスの一致数をカウントし、全体の正解率を算出する。
-    """
-    model.eval()  # 評価モードに切り替え
-    total_correct = 0
-    total_samples_count = 0
+    """  
+    model.eval() 
 
+    total = 0
+    correct = 0
+
+    # value/margin損失はデバイス上でTensorとして累積し、最後に同期して取り出す
+    total_value_loss  = torch.tensor(0.0, device=device)
+    total_margin_loss = torch.tensor(0.0, device=device)
+
+    # MSE を累積（reduction='sum' にして、後で batch サイズで割る）
+    criterion = torch.nn.MSELoss(reduction='sum')
+  
+    start_time = time.time()
+    train_logger.info(f"[rank 0] validate_model: started with {len(test_loader)} batches")
+
+    # TPU 向けにデバイスローダー経由で非同期転送
+    val_device_loader = MpDeviceLoader(test_loader, device)
+    
     with torch.no_grad():  # 評価時は勾配計算を行わない
-        for boards, target_policies, _, _ in tqdm(test_loader, desc="Validation", bar_format=bar_fmt, miniters=100,
-            leave=False, dynamic_ncols=True, position=0):
-            boards = boards.to(device)
-            target_policies = target_policies.to(device)
-            pred_policy, _ = model(boards)
-            # 各サンプルで、最も高い確率のインデックスが一致するか判定
-            correct = (pred_policy.argmax(dim=1) == target_policies.argmax(dim=1)).sum().item()
-            total_correct += correct
-            total_samples_count += boards.size(0)
+        for boards, target_policies, target_values, target_margins in tqdm(
+            val_device_loader,
+            desc="Validation", bar_format=bar_fmt, position=0, **tqdm_kwargs
+        ):
 
-    policy_accuracy = total_correct / total_samples_count
-    train_logger.info(f"===== Validation Policy Accuracy ==== 【{policy_accuracy:.5f}】")
+            # 推論
+            pred_policies, (pred_values, pred_margins) = model(boards)
 
-    return policy_accuracy
+            # --- policy accuracy ---
+            _, predicted = pred_policies.max(dim=1)
+            _, labels    = target_policies.max(dim=1)
+            correct += (predicted == labels).sum().item()
+            batch_size = boards.size(0)
+
+            # --- value MSE を Tensor 累積 ---
+            total_value_loss += criterion(
+                pred_values.view(-1), target_values.view(-1)
+            )
+
+            # --- margin MSE を Tensor 累積 ---
+            total_margin_loss += criterion(
+                pred_margins.view(-1), target_margins.view(-1)
+            )
+
+            # サンプル数カウント
+            total += batch_size
+            # パイプラインをフラッシュして一括実行
+            xm.mark_step()
+
+    # 平均化
+    policy_acc   = correct / total
+    value_mse    = total_value_loss.item()  / total
+    margin_mse   = total_margin_loss.item() / total
+
+    elapsed = time.time() - start_time
+    minutes = int(elapsed // 60)
+    seconds = int(elapsed % 60)
+    train_logger.info(f"[rank 0] validation completed in {minutes}m{seconds}s")
+    train_logger.info(f"== Validation :policy accuracy:【{policy_acc:.5f}】 value_mse: {value_mse:.5f}, margin_mse: {margin_mse:.5f}")
+
+    model.train()
+
+    return policy_acc, value_mse, margin_mse
 
 # ==============================
 # チェックポイント保存＆復元関数
@@ -502,30 +548,6 @@ def load_checkpoint(model, optimizer, scheduler, checkpoint_file, device):
     else:
         train_logger.info("No checkpoint found. Starting from scratch.")
         return 0, 0.0, -1, None
-
-# ==============================
-# sgfファイル用進捗チェックポイント保存＆復元
-# ==============================
-def save_progress_checkpoint(remaining_files):
-    """
-    残りのSGFファイルリストをpickle形式で保存する関数
-    """
-    with open(PROGRESS_CHECKPOINT_FILE, "wb") as f:
-        pickle.dump(remaining_files, f)
-    # train_logger.info(f"Progress checkpoint saved to {PROGRESS_CHECKPOINT_FILE}")
-
-def load_progress_checkpoint():
-    """
-    進捗チェックポイントファイルから、残りのSGFファイルリストを読み込む関数
-    """
-    if os.path.exists(PROGRESS_CHECKPOINT_FILE):
-        with open(PROGRESS_CHECKPOINT_FILE, "rb") as f:
-            remaining_files = pickle.load(f)
-        train_logger.debug(f"Progress checkpoint loaded from {PROGRESS_CHECKPOINT_FILE}")
-        return remaining_files
-    else:
-        train_logger.debug("No progress checkpoint found.")
-        return None
 
 # ==============================
 # Test用データセット生成（zip利用）
