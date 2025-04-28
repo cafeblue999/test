@@ -147,6 +147,12 @@ def _mp_fn(rank):
     local_loop_cnt = 0
 
     while True:
+        # epoch と rank を組み合わせたシード
+        base_seed = int(time.time_ns() % (2**32))
+        seed = base_seed + local_loop_cnt * world_size + ordinal
+        random.seed(seed)
+        torch.manual_seed(seed)
+
         # モデル／オプティマイザ／スケジューラ生成
         model = EnhancedResNetPolicyValueNetwork(
             BOARD_SIZE, model_channels, num_residual_blocks, NUM_CHANNELS
@@ -164,11 +170,7 @@ def _mp_fn(rank):
         )
         # モデルを改めてXLAデバイスに配置（復元後）
         model.to(device)   
-   
-        # epoch と rank を組み合わせたシード
-        base_seed = int(time.time_ns() % (2**32))
-        random.seed(base_seed + local_loop_cnt * world_size + ordinal)
-        
+          
         if rank == 0:
             current_lr = optimizer.param_groups[0]["lr"]
             train_logger.info(f"[rank {rank}] =========== params ============")
@@ -212,6 +214,7 @@ def _mp_fn(rank):
             num_replicas=world_size,
             rank=ordinal,
             shuffle=True,
+            seed=seed,
             drop_last=True
         )
 
