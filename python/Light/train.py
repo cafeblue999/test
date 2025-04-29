@@ -1,6 +1,8 @@
 import os
 import random
 import time
+import datetime
+import pytz
 import gc
 import numpy as np
 import torch
@@ -26,7 +28,7 @@ from dataset import (
     load_checkpoint
 )
 
-from config import PREFIX, USE_TPU, FORCE_RELOAD, TRAIN_SGF_DIR, VAL_SGF_DIR, MODEL_OUTPUT_DIR, INFERENCE_MODEL_PREFIX, CHECKPOINT_FILE, bar_fmt, get_logger, tqdm_kwargs
+from config import PREFIX, USE_TPU, FORCE_RELOAD, TRAIN_SGF_DIR, VAL_SGF_DIR, MODEL_OUTPUT_DIR, INFERENCE_MODEL_PREFIX, CHECKPOINT_FILE, bar_fmt, get_logger, tqdm_kwargs, LOG_DIR
 
 from utils import BOARD_SIZE, HISTORY_LENGTH, NUM_CHANNELS, num_residual_blocks, model_channels, batch_size, learning_rate, patience, factor, number_max_files, number_proc_files, CONFIG_PATH, val_interval, w_policy_loss, w_value_loss, w_margin_loss
 
@@ -34,6 +36,13 @@ import torch.multiprocessing as mp
 mp.set_sharing_strategy('file_system')
 
 train_logger = get_logger()
+
+# 重み付き損失ログ用ディレクトリ
+LOSS_LOG_DIR = os.path.join(LOG_DIR, "loss_logs")
+os.makedirs(LOSS_LOG_DIR, exist_ok=True)
+
+# JSTタイムゾーンを定義
+jst = pytz.timezone('Asia/Tokyo')
 
 # ==============================
 # 訓練ループ用関数（1エポック分）
@@ -62,6 +71,18 @@ def train_one_iteration(
         value_loss  = F.mse_loss(pred_value.view(-1), target_values.view(-1))
         margin_loss = F.mse_loss(pred_margin.view(-1), target_margins.view(-1))
         loss = w_policy_loss * policy_loss + w_value_loss * value_loss + w_margin_loss * margin_loss
+
+        # ── weighted loss のログ追記 ──
+        weighted_policy_loss = w_policy_loss * policy_loss.item()
+        weighted_value_loss  = w_value_loss  * value_loss.item()
+        ts = datetime.datetime.now(jst).strftime("%Y-%m-%d %H:%M:%S")
+        # policy loss
+        with open(os.path.join(LOSS_LOG_DIR, "weighted_policy_loss.log"), "a", encoding="utf-8") as f:
+            f.write(f"{ts},{local_loop_cnt},{i},{weighted_policy_loss:.6f}\n")
+        # value loss
+        with open(os.path.join(LOSS_LOG_DIR, "weighted_value_loss.log"), "a", encoding="utf-8") as f:
+            f.write(f"{ts},{local_loop_cnt},{i},{weighted_value_loss:.6f}\n")
+        # ─────────────────────────────────
 
         if not torch.isfinite(loss):
             train_logger.error(f"[rank {rank}] Invalid loss: {loss}. Skipping this batch.")
@@ -96,7 +117,7 @@ def train_one_iteration(
     if rank == 0:
         avg_loss = total_loss / len(train_loader)
         acc = overall_correct / overall_samples
-        train_logger.info(f"[rank {rank}] Epoch {local_loop_cnt} iteration done. loss={avg_loss:.5f}, acc={acc:.5f}")
+        train_logger.info(f"[rank {rank}] Epoch {local_loop_cnt}: iteration done. loss={avg_loss:.5f}, acc={acc:.5f}")
     
     return total_loss / len(train_loader)
 
@@ -127,7 +148,7 @@ def _mp_fn(rank):
         # テストデータ準備（ループ外で一度だけ）
         test_dataset_pickle = os.path.join(VAL_SGF_DIR, "test_dataset.pkl")
         test_samples = prepare_test_dataset(
-            VAL_SGF_DIR, BOARD_SIZE, HISTORY_LENGTH, augment_all=True, output_file=test_dataset_pickle
+            VAL_SGF_DIR, BOARD_SIZE, HISTORY_LENGTH, augment_all=False, output_file=test_dataset_pickle
         )
         test_loader = DataLoader(
             AlphaZeroSGFDatasetPreloaded(test_samples),
@@ -205,7 +226,7 @@ def _mp_fn(rank):
             with open(sgf_file, "r", encoding="utf-8") as f:
                 sgf_src = f.read()
             samples.extend(process_sgf_to_samples_from_text(
-                sgf_src, BOARD_SIZE, HISTORY_LENGTH, augment_all=True
+                sgf_src, BOARD_SIZE, HISTORY_LENGTH, augment_all=False
             ))
         if not samples:
             train_logger.warning(f"[rank {rank}] No samples generated. Skipping epoch {local_loop_cnt}.")

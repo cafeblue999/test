@@ -419,8 +419,11 @@ def validate_model(model, test_loader, device):
 
     total = 0
     correct = 0
-    sum_value_loss  = 0.0
-    sum_margin_loss = 0.0
+
+    # value/margin損失はデバイス上でTensorとして累積し、最後に同期して取り出す
+    total_value_loss  = torch.tensor(0.0, device=device)
+    total_margin_loss = torch.tensor(0.0, device=device)
+
     # MSE を累積（reduction='sum' にして、後で batch サイズで割る）
     criterion = torch.nn.MSELoss(reduction='sum')
   
@@ -429,16 +432,14 @@ def validate_model(model, test_loader, device):
 
     # TPU 向けにデバイスローダー経由で非同期転送
     val_device_loader = MpDeviceLoader(test_loader, device)
+    
     with torch.no_grad():  # 評価時は勾配計算を行わない
         for boards, target_policies, target_values, target_margins in tqdm(
             val_device_loader,
             desc="Validation", bar_format=bar_fmt, position=0, **tqdm_kwargs
         ):
 
-            # 非同期転送のキック
-            xm.mark_step()
-
-            # 推論（model が policy, value, margin の３つを返す想定）
+            # 推論
             pred_policies, (pred_values, pred_margins) = model(boards)
 
             # --- policy accuracy ---
@@ -447,24 +448,25 @@ def validate_model(model, test_loader, device):
             correct += (predicted == labels).sum().item()
             batch_size = boards.size(0)
 
-            # --- value MSE ---
-            sum_value_loss += criterion(
-                pred_values.view(-1),           # (B,)
-                target_values.view(-1)          # (B,)
-            ).item()
+            # --- value MSE を Tensor 累積 ---
+            total_value_loss += criterion(
+                pred_values.view(-1), target_values.view(-1)
+            )
 
-            # --- margin MSE ---
-            sum_margin_loss += criterion(
-                pred_margins.view(-1),          # (B,)
-                target_margins.view(-1)         # (B,)
-            ).item()
-            
+            # --- margin MSE を Tensor 累積 ---
+            total_margin_loss += criterion(
+                pred_margins.view(-1), target_margins.view(-1)
+            )
+
+            # サンプル数カウント
             total += batch_size
- 
+            # パイプラインをフラッシュして一括実行
+            xm.mark_step()
+
     # 平均化
     policy_acc   = correct / total
-    value_mse    = sum_value_loss  / total
-    margin_mse   = sum_margin_loss / total
+    value_mse    = total_value_loss.item()  / total
+    margin_mse   = total_margin_loss.item() / total
 
     elapsed = time.time() - start_time
     minutes = int(elapsed // 60)
