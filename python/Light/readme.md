@@ -1,176 +1,112 @@
-## コード処理内容及び仕様書（詳細・関数別解説付き）
+# プロジェクト：クラス／関数一覧
 
-本書は、以下 5 つのファイル (`config.py`, `utils.py`, `model.py`, `dataset.py`, `train.py`) からなるプロジェクトの処理内容および仕様を、**処理順・関数単位**で詳細に記述したドキュメントである。
-印刷配布可能な形式として Markdown ベースで構成している。
-
----
-
-### 目次
-
-1. [config.py](#configpy)
-2. [utils.py](#utilspy)
-3. [model.py](#modelpy)
-4. [dataset.py](#datasetpy)
-5. [train.py](#trainpy)
+以下、各ファイルごとに定義されている**クラス**および**関数**を漏れなく列挙し、簡単な説明を付しています。
 
 ---
 
-<a name="configpy"></a>
+## config.py
 
-## 1. config.py
+### クラス
 
-### 関数：`get_logger(name: str, level=logging.INFO)`
+- **FileLogger**  
+  ファイル＋コンソール出力対応のシンプルなロガークラス
+  - `debug(msg)`, `info(msg)`, `warning(msg)`, `error(msg)` メソッド
 
-- **目的**：ファイルおよびコンソールにログを出力するロガーを構築
-- **処理内容**：
-  1. `logging.getLogger(name)` によりロガーインスタンス取得
-  2. ログレベルを設定（デフォルト：INFO）
-  3. `StreamHandler`（コンソール）と `FileHandler`（log/train.log）を追加
-  4. フォーマット：時間付き `[INFO] メッセージ` 形式
+### 関数
 
----
-
-<a name="utilspy"></a>
-
-## 2. utils.py
-
-### 定数群
-
-- `BOARD_SIZE`：囲碁盤のサイズ（19）
-- `HISTORY_LENGTH`：履歴の深さ（過去 8 手）
-- `NUM_CHANNELS`：学習モデル入力チャネル数（17）
-- `model_channels`, `num_residual_blocks`：ResNet 設定
-- `batch_size`, `learning_rate`, `patience`, `factor`, `number_max_files`：学習パラメータ
-- `bar_fmt`：tqdm のプログレスバー用書式文字列
+- **get_logger(name: str, level: int=logging.INFO)**  
+  標準の `logging` モジュールに `StreamHandler` + `FileHandler` を追加したロガーを返す
+- **fixed_format_interval(seconds: float) → str**  
+  tqdm 用の時間表示フォーマットを `hh:mm:ss` に固定する
+- **（その他 CLI 引数パース／環境変数設定／定数定義）**  
+  `PREFIX`, `FORCE_RELOAD`, `USE_TPU`, `TRAIN_SGF_DIR` などのグローバル設定
 
 ---
 
-<a name="modelpy"></a>
+## utils.py
 
-## 3. model.py
+### 定数
 
-### クラス：`EnhancedResNetPolicyValueNetwork`
+- **BOARD_SIZE**（int）
+- **HISTORY_LENGTH**（int）
+- **NUM_CHANNELS**（int）
+- **model_channels**（int）／**num_residual_blocks**（int）
+- **batch_size**, **learning_rate**, **patience**, **factor**, **number_max_files**
+- **bar_fmt**（str）  
+  — いずれもモデル・学習ループの設定用パラメータ
 
-- **目的**：囲碁の盤面を入力とし、着手確率（policy）と勝率（value）を出力する。
-
-#### `__init__()`
-
-- **引数**：`board_size`, `channels`, `num_blocks`, `input_channels`
-- **処理内容**：
-  - 初期 Conv + BatchNorm
-  - `num_blocks`回の ResBlock（`self.res_blocks`）
-  - `policy_head`（盤面全体＋パス用 Softmax）
-  - `value_head`（出力 1 つ、tanh）
-
-#### `forward(x)`
-
-- **引数**：Tensor (B, C, 19, 19)
-- **出力**：
-  - `policy`: Tensor (B, 362)
-  - `value`: Tensor (B, 1)
-  - `margin`: Tensor (B, 1)
-- **内部処理**：ResNet 構造で特徴抽出 → ヘッド分岐して出力計算
+> ※ 関数は定義されていません。
 
 ---
 
-<a name="datasetpy"></a>
+## model.py
 
-## 4. dataset.py
+### クラス
 
-### クラス：`AlphaZeroSGFDatasetPreloaded`
-
-- **目的**：事前に SGF ファイルをすべて読み込み、学習用サンプルに変換する Dataset クラス
-
-#### `__init__(self, samples)`
-
-- `samples`：局面データ（特徴・policy・value・margin）
-- 全体をリストとして保持
-
-#### `__len__()`
-
-- 保持するサンプル数を返す
-
-#### `__getitem__(idx)`
-
-- 指定されたサンプルインデックスの局面を返す
-- `board`, `target_policy`, `target_value`, `target_margin`
+- **ResidualBlock(nn.Module)**  
+  ResNet の 1 段分残差ブロック
+- **SelfAttention(nn.Module)**  
+  空間的自己注意機構を実装する層
+- **EnhancedResNetPolicyValueNetwork(nn.Module)**
+  - `__init__(...)`  
+    入力畳み込み／BatchNorm／残差ブロック群／ポリシーヘッド／バリューヘッドを定義
+  - `forward(x) → (policy_logits, (value, margin))`  
+    順伝播結果として対数確率ポリシーと勝率・マージンを返す
 
 ---
 
-### 関数：`prepare_test_dataset()`
+## dataset.py
 
-- SGF バリデーションデータを読み込み、テスト用に整形して返す
+### クラス
 
-### 関数：`load_progress_checkpoint()`／`save_progress_checkpoint()`
+- **AlphaZeroSGFDatasetPreloaded(Dataset)**
+  - `__init__(samples: List[Tuple])`
+  - `__len__() → int`
+  - `__getitem__(idx) → (board_tensor, policy, value, margin)`  
+    事前生成済みサンプルを PyTorch Dataset として扱う
 
-- pickle ファイルによる進捗保存・復元
+### 関数
 
-### 関数：`process_sgf_to_samples_from_text(text)`
-
-- SGF ファイルの文字列を直接パースして、訓練サンプル化
-
----
-
-<a name="trainpy"></a>
-
-## 5. train.py
-
-### 関数：`validate_model(model, test_loader, device)`
-
-- **目的**：検証データに対する policy accuracy, value loss, margin loss を計算
-- **処理内容**：
-  1. `model.eval()` 設定
-  2. 各バッチで `forward` 実行し、出力取得：`policy, value, margin`
-  3. クロスエントロピー：`F.cross_entropy(policy_pred, target_policy)`
-  4. MSE：`F.mse_loss(value_pred, target_value)`, `F.mse_loss(margin_pred, target_margin)`
-  5. Accuracy 計算：`argmax`を比較して正解率を累積
-  6. Tensor で同期して平均を返す（TPU 並列考慮）
-
-### 関数：`save_checkpoint(model, optimizer, scheduler, epoch, best_policy_accuracy, best_total_loss)`
-
-- モデル構造・重み、オプティマイザ状態、スケジューラ、スコアを辞書に保存
-- `torch.save()` で `checkpoint_X.pt` として出力
-
-### 関数：`load_checkpoint(...)`
-
-- 上記チェックポイントを読み込み、model/load_state_dict、optimizer.load_state_dict 等を適用
-
-### 関数：`save_best_model(model, policy_accuracy, device)`
-
-- 現在の policy accuracy が過去最高であれば、
-  - `model_{prefix}_acc_{score}.pt` として保存
-  - `save_inference_model()` により軽量モデルも保存
-
-### 関数：`save_inference_model(model, device, output_file)`
-
-- `model.to(device)` で配置後、`torch.jit.trace(model, dummy_input)` → `save()` で保存
-
-### 関数：`_mp_fn(rank)`
-
-- TPU/XLA 分散学習の各プロセスが実行する本体関数
-
-#### 処理概要：
-
-1. SGF zip ファイル読み込み → ランダムに分割サンプリング
-2. `DistributedSampler` → `DataLoader` 構築（rank ごとに異なるサンプル）
-3. **損失計算の詳細**：
-
-```python
-policy_loss = F.cross_entropy(policy_preds, target_policies)
-value_loss  = F.mse_loss(value_preds.squeeze(1), target_values)
-margin_loss = F.mse_loss(margin_preds.squeeze(1), target_margins)
-```
-
-4. **合計損失**：重み付き和
-
-```python
-total_loss = w_policy_loss * policy_loss + w_value_loss * value_loss + w_margin_loss * margin_loss
-```
-
-5. `total_loss.backward()` → `optimizer.step()` で更新
-6. validation タイミングで `validate_model()` を実行
-7. `best_policy_accuracy` や `best_total_loss` を更新判定して保存
+- **parse_sgf(sgf_text: str) → Dict**  
+  SGF 文字列をノード辞書リスト (`{"root":…, "nodes": […]}`) に分解
+- **build_input_from_history(history: List[np.ndarray], current_player, board_size, history_length) → np.ndarray**  
+  17 チャネル入力テンソルを構築
+- **process_sgf_to_samples_from_text(sgf_src: str, board_size, history_length, augment_all: bool) → List[Tuple]**  
+  各ノードごとに `(board, policy, value, margin)` サンプルを生成
+- **prepare_test_dataset(sgf_dir, board_size, history_length, augment_all, output_file) → List[Tuple]**  
+  ZIP/SGF からテスト用サンプルを生成・pickle キャッシュ
+- **save_dataset(samples: List[Tuple], output_file: str) → None**  
+  サンプルリストを pickle 形式で保存
+- **load_dataset(output_file: str) → List[Tuple]**  
+  pickle からサンプルリストを読み込み
+- **validate_model(model, test_loader, device) → (policy_acc, value_mse, margin_mse, total_loss)**  
+  検証データに対する精度・MSE・合計損失を計算
+- **save_inference_model(model, device, model_name: str) → None**  
+  TorchScript 推論モデルを生成・保存
+- **save_best_acc_model(model, policy_accuracy: float, device) → None**  
+  policy accuracy ベースで最良モデル保存＋古いファイル削除
+- **save_best_loss_model(model, total_loss: float, device) → None**  
+  total loss ベースで最良モデル保存＋古いファイル削除
+- **save_checkpoint(model, optimizer, scheduler, best_total_loss, best_policy_accuracy, checkpoint_file: str) → None**  
+  学習中間チェックポイントを保存
+- **save_checkpoint_nolog(...) → None**  
+  ログ出力なし版チェックポイント保存
+- **recursive_to(data, device) → Any**  
+  ネスト構造中の Tensor を再帰的に `.to(device)`
+- **load_checkpoint(model, optimizer, scheduler, checkpoint_file: str, device) → (best_total_loss, best_policy_accuracy)**  
+  チェックポイントから状態を復元
 
 ---
 
-以上が関数単位での処理内容および設計理由、損失計算など関数内部ロジックまで含めた詳細な仕様解説である。さらに必要であれば、コード抜粋や図式化なども可能。
+## train.py
+
+### 関数
+
+- **train_one_iteration(model, train_loader, optimizer, device, local_loop_cnt, rank) → float**  
+  1 エポック分の訓練（順伝播／損失計算／逆伝播／更新）を実施し平均 loss を返す
+- **\_mp_fn(rank: int) → None**  
+  TPU/XLA 分散環境下で各プロセスが実行するメイン学習ループ
+- **main() → None**  
+  CLI から `_mp_fn` を呼び出すエントリポイント
+
+---
