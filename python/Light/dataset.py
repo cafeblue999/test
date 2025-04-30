@@ -551,6 +551,12 @@ def validate_model(model, test_loader, device):
             position=0,
             **tqdm_kwargs
         ):
+            # --- デバイス転送 ---
+            boards        = boards.to(device,      non_blocking=True)
+            t_policies    = t_policies.to(device,  non_blocking=True)
+            t_values      = t_values.to(device,    non_blocking=True)
+            t_margins     = t_margins.to(device,   non_blocking=True)
+
             B = boards.size(0)
             total_samples += B
 
@@ -563,7 +569,7 @@ def validate_model(model, test_loader, device):
             correct += (preds == labels).sum()
 
             # 損失合計（sum reduction）
-            policy_sum += -(t_policies * p_logits).sum()
+            policy_sum += F.nll_loss(p_logits, labels, reduction='sum')
             value_sum  += F.mse_loss(v_pred.view(-1), t_values.view(-1), reduction='sum')
             margin_sum += F.mse_loss(m_pred.view(-1), t_margins.view(-1), reduction='sum')
 

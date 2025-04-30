@@ -82,9 +82,11 @@ def train_one_iteration(model, train_loader, optimizer, device, local_loop_cnt, 
         target_values   = target_values.to(device, non_blocking=True)
         target_margins  = target_margins.to(device, non_blocking=True)
 
-        # 順伝播→損失計算
+        # 順伝播→損失計算（損失定義を検証時と同じクロスエントロピーに統一）
         pred_policy, (pred_value, pred_margin) = model(boards)
-        policy_loss = -torch.sum(target_policies * pred_policy) / boards.size(0)
+        # one-hot の target_policies からラベルインデックスに変換
+        target_labels = torch.argmax(target_policies, dim=1)
+        policy_loss = F.nll_loss(pred_policy, target_labels)
         value_loss  = F.mse_loss(pred_value.view(-1), target_values.view(-1))
         margin_loss = F.mse_loss(pred_margin.view(-1), target_margins.view(-1))
         loss = w_policy_loss * policy_loss + w_value_loss * value_loss + w_margin_loss * margin_loss
