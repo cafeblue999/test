@@ -4,6 +4,7 @@ import time
 import datetime
 import pytz
 import gc
+import zipfile
 import numpy as np
 import torch
 import torch.optim as optim
@@ -150,21 +151,26 @@ def _mp_fn(rank):
         test_samples = prepare_test_dataset(
             VAL_SGF_DIR, BOARD_SIZE, HISTORY_LENGTH, augment_all=False, output_file=test_dataset_pickle
         )
-        test_loader = DataLoader(
-            AlphaZeroSGFDatasetPreloaded(test_samples),
-            batch_size=batch_size, shuffle=False
-        )
+        test_loader = DataLoader(AlphaZeroSGFDatasetPreloaded(test_samples), batch_size=batch_size, shuffle=False)
         train_logger.info(f"[rank {rank}] Test loader ready. {len(test_loader.dataset)} samples")
 
     # 最良精度の初期化
     best_policy_accuracy = 0.0
 
     # 全ファイル読み込み
-    all_files = [
-        os.path.join(TRAIN_SGF_DIR, f)
-        for f in sorted(os.listdir(TRAIN_SGF_DIR))
-        if f.endswith('.sgf') and "analyzed" not in f.lower()
-    ]
+    zip_path = os.path.join(TRAIN_SGF_DIR, 'train.zip')
+
+    all_files = []
+
+    with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+        # .sgfファイルのうち "analyzed" を含まないファイルを対象
+        sgf_files = [
+            (zip_path, name)
+            for name in zip_ref.namelist()
+            if name.endswith('.sgf') and "analyzed" not in name.lower()
+        ]
+        all_files.extend(sgf_files)
+
     train_logger.info(f"[rank {rank}] Available {len(all_files)} SGF files (shared across all ranks)")
     
     local_loop_cnt = 0
@@ -222,10 +228,12 @@ def _mp_fn(rank):
 
         # SGF→サンプル生成
         samples = []
-        for sgf_file in selected:
-            with open(sgf_file, "r", encoding="utf-8") as f:
-                sgf_src = f.read()
-            samples.extend(process_sgf_to_samples_from_text(
+        # selected は [(zip_path, entry_name), ...] のリストなので、展開して読み込む
+        for zip_path, entry_name in selected:
+            with zipfile.ZipFile(zip_path, 'r') as zf:
+            # バイナリとして読み込んだ後、文字列に
+                sgf_src = zf.read(entry_name).decode('utf-8')
+                samples.extend(process_sgf_to_samples_from_text(
                 sgf_src, BOARD_SIZE, HISTORY_LENGTH, augment_all=False
             ))
         if not samples:
@@ -318,8 +326,8 @@ def main():
     train_logger.info(f"number_max_files: {number_max_files}")
     train_logger.info(f"val_interval: {val_interval}")
     train_logger.info(f"w_policy_loss: {w_policy_loss}")
-    train_logger.info(f"w_value_loss: {w_value_loss}")
-    train_logger.info(f"w_value_loss: {w_margin_loss}")
+    train_logger.info(f"w_value_loss:  {w_value_loss}")
+    train_logger.info(f"w_value_loss:  {w_margin_loss}")
     train_logger.info(f"===============================")
 
     # ここに各種初期化、設定ロード、ロガー設定など
