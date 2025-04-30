@@ -1,10 +1,10 @@
 import os
+import zipfile
 import random
 import time
 import datetime
 import pytz
 import gc
-import zipfile
 import numpy as np
 import torch
 import torch.optim as optim
@@ -23,7 +23,8 @@ from dataset import (
     save_checkpoint,
     save_checkpoint_nolog,
     validate_model,
-    save_best_model,
+    save_best_acc_model,
+    #save_best_loss_model,
     save_inference_model,
     process_sgf_to_samples_from_text,
     load_checkpoint
@@ -48,10 +49,8 @@ jst = pytz.timezone('Asia/Tokyo')
 # ==============================
 # 訓練ループ用関数（1エポック分）
 # ==============================
-def train_one_iteration(
-    model, train_loader, optimizer, scheduler, device,
-    local_loop_cnt, checkpoint_interval, best_policy_accuracy, rank
-):
+def train_one_iteration(model, train_loader, optimizer, device, local_loop_cnt, rank):
+
     model.train()
 
     total_loss = total_policy = total_value = total_margin = 0.0
@@ -74,15 +73,16 @@ def train_one_iteration(
         loss = w_policy_loss * policy_loss + w_value_loss * value_loss + w_margin_loss * margin_loss
 
         # ── weighted loss のログ追記 ──
-        weighted_policy_loss = w_policy_loss * policy_loss.item()
-        weighted_value_loss  = w_value_loss  * value_loss.item()
-        ts = datetime.datetime.now(jst).strftime("%Y-%m-%d %H:%M:%S")
-        # policy loss
-        with open(os.path.join(LOSS_LOG_DIR, "weighted_policy_loss.log"), "a", encoding="utf-8") as f:
-            f.write(f"{ts},{local_loop_cnt},{i},{weighted_policy_loss:.6f}\n")
-        # value loss
-        with open(os.path.join(LOSS_LOG_DIR, "weighted_value_loss.log"), "a", encoding="utf-8") as f:
-            f.write(f"{ts},{local_loop_cnt},{i},{weighted_value_loss:.6f}\n")
+        if rank == 0:
+            weighted_policy_loss = w_policy_loss * policy_loss.item()
+            weighted_value_loss  = w_value_loss  * value_loss.item()
+            ts = datetime.datetime.now(jst).strftime("%Y-%m-%d %H:%M:%S")
+            # policy loss
+            with open(os.path.join(LOSS_LOG_DIR, "weighted_policy_loss.log"), "a", encoding="utf-8") as f:
+                f.write(f"{ts},{local_loop_cnt},{i},{weighted_policy_loss:.6f}\n")
+            # value loss
+            with open(os.path.join(LOSS_LOG_DIR, "weighted_value_loss.log"), "a", encoding="utf-8") as f:
+                f.write(f"{ts},{local_loop_cnt},{i},{weighted_value_loss:.6f}\n")
         # ─────────────────────────────────
 
         if not torch.isfinite(loss):
@@ -128,9 +128,6 @@ def train_one_iteration(
 from torch.utils.data.distributed import DistributedSampler
 def _mp_fn(rank):
    
-    # チェックポイント保存間隔（秒）
-    checkpoint_interval = 600
-
     # デバイス初期化
     if USE_TPU:
         device     = xm.xla_device()
@@ -151,7 +148,10 @@ def _mp_fn(rank):
         test_samples = prepare_test_dataset(
             VAL_SGF_DIR, BOARD_SIZE, HISTORY_LENGTH, augment_all=False, output_file=test_dataset_pickle
         )
-        test_loader = DataLoader(AlphaZeroSGFDatasetPreloaded(test_samples), batch_size=batch_size, shuffle=False)
+        test_loader = DataLoader(
+            AlphaZeroSGFDatasetPreloaded(test_samples),
+            batch_size=batch_size, shuffle=False
+        )
         train_logger.info(f"[rank {rank}] Test loader ready. {len(test_loader.dataset)} samples")
 
     # 最良精度の初期化
@@ -170,7 +170,7 @@ def _mp_fn(rank):
             if name.endswith('.sgf') and "analyzed" not in name.lower()
         ]
         all_files.extend(sgf_files)
-
+            
     train_logger.info(f"[rank {rank}] Available {len(all_files)} SGF files (shared across all ranks)")
     
     local_loop_cnt = 0
@@ -193,10 +193,7 @@ def _mp_fn(rank):
         )
 
         # 既存チェックポイントの読み込み
-        epoch, best_policy_accuracy, last_batch_idx, base_seed = load_checkpoint(
-            model, optimizer, scheduler,
-            CHECKPOINT_FILE, device
-        )
+        best_total_loss, best_policy_accuracy = load_checkpoint(model, optimizer, scheduler, CHECKPOINT_FILE, device)
         # モデルを改めてXLAデバイスに配置（復元後）
         model.to(device)   
           
@@ -208,11 +205,12 @@ def _mp_fn(rank):
             train_logger.info(f"[rank {rank}] patience: {patience}")
             train_logger.info(f"[rank {rank}] factor: {factor}")
             train_logger.info(f"[rank {rank}] number_max_files: {number_max_files}")
+            train_logger.info(f"[rank {rank}] best_total_loss (from checkpoint): {best_total_loss:.5f}")
             train_logger.info(f"[rank {rank}] best_policy_accuracy (from checkpoint): {best_policy_accuracy:.5f}")
             train_logger.info(f"[rank {rank}] val_interval: {val_interval}")
             train_logger.info(f"[rank {rank}] w_policy_loss: {w_policy_loss}")
-            train_logger.info(f"[rank {rank}] w_value_loss: {w_value_loss}")
-            train_logger.info(f"[rank {rank}] w_value_loss: {w_margin_loss}")
+            train_logger.info(f"[rank {rank}] w_value_loss:  {w_value_loss}")
+            train_logger.info(f"[rank {rank}] w_value_loss:  {w_margin_loss}")
             train_logger.info(f"[rank {rank}] ===============================")
         
         # ① 全rank共通でnumber_max_filesファイルを全SGFファイルより選択
@@ -259,12 +257,8 @@ def _mp_fn(rank):
         train_device_loader = MpDeviceLoader(train_loader, device)
 
         # １エポック分の訓練（デバイスローダーを渡す）
-        avg_loss = train_one_iteration(
-            model, train_device_loader, optimizer, scheduler,
-             device, local_loop_cnt, checkpoint_interval,
-             best_policy_accuracy, rank
-        )
-        train_logger.debug(f"[rank {rank}] train_one_iteration end, avg_loss: {avg_loss:0.5f}")
+        avg_loss = train_one_iteration(model, train_device_loader, optimizer, device, local_loop_cnt, rank)
+        train_logger.info(f"[rank {rank}] train_one_iteration end, avg_loss: {avg_loss:0.5f}")
 
         local_loop_cnt += 1
 
@@ -274,35 +268,33 @@ def _mp_fn(rank):
             
             # 検証を実行
             with torch.no_grad():
-                policy_accuracy, value_mse, margin_mse = validate_model(model, test_loader, device)
+                policy_acc, avg_value_mse, avg_margin_mse, total_loss = validate_model(model, test_loader, device)
 
-            if policy_accuracy > best_policy_accuracy:
-                best_policy_accuracy = save_best_model(
-                    model, policy_accuracy, device, best_policy_accuracy
-                )
+            if total_loss < best_total_loss:
+                train_logger.info(f"[rank {rank}] _mp_fn: total_loss {best_total_loss:.5f} → {total_loss:.5f}" )
+                best_total_loss = total_loss
+            #    save_best_loss_model(model, total_loss, device)
+            #else:
+            #    save_inference_model(model, device, f"{INFERENCE_MODEL_PREFIX}_loss_tmp.pt")
+
+            if policy_acc > best_policy_accuracy:
+                save_best_acc_model(model, policy_acc, device)
             else:
-                save_inference_model(model, device, f"{INFERENCE_MODEL_PREFIX}_tmp.pt")
+                save_inference_model(model, device, f"{INFERENCE_MODEL_PREFIX}_acc_tmp.pt")
 
             # scheduler.step() 実行前の学習率を表示
             before_lr = optimizer.param_groups[0]["lr"]
-            train_logger.info(f"[rank {rank}] _mp_fn: Before scheduler.step(): learning rate = {before_lr:.8f}")           
+            train_logger.info(f"[rank {rank}] _mp_fn: Before scheduler.step(): learning rate = {before_lr:.8f}") 
+
             # 学習率調整
-            scheduler.step(policy_accuracy)
+            scheduler.step(policy_acc)
+
             # scheduler.step() 実行後の学習率を表示
             after_lr = optimizer.param_groups[0]["lr"]
             train_logger.info(f"[rank {rank}] _mp_fn: After  scheduler.step(): learning rate = {after_lr:.8f}")
 
             # チェックポイント保存
-            save_checkpoint(
-                model, optimizer, scheduler,
-                local_loop_cnt,        # epoch 保存
-                0.0,                   # val_loss は使用せず
-                0,                     # epochs_no_improve は使用せず
-                best_policy_accuracy,
-                CHECKPOINT_FILE, device,
-                batch_idx=-1,          # バッチ再開なし
-                base_seed=None
-            )
+            save_checkpoint(model, optimizer, scheduler, best_total_loss, best_policy_accuracy, CHECKPOINT_FILE)
             train_logger.info(f"[rank {rank}] Epoch {local_loop_cnt} completed. best_acc={best_policy_accuracy:.5f}")
 
         del model, optimizer, scheduler, samples, train_dataset, train_loader, train_device_loader

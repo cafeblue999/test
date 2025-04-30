@@ -5,12 +5,13 @@ import pickle
 import zipfile
 import numpy as np
 import torch
+import torch.nn.functional as F
 import torch_xla.core.xla_model as xm
 from torch_xla.distributed.parallel_loader import MpDeviceLoader
 from torch.utils.data import Dataset
 from tqdm import tqdm
-from config import get_logger, PREFIX, MODEL_OUTPUT_DIR, INFERENCE_MODEL_PREFIX, bar_fmt, TEST_SGFS_ZIP, tqdm_kwargs
-from utils  import BOARD_SIZE, NUM_CHANNELS
+from config import USE_TPU, get_logger, PREFIX, MODEL_OUTPUT_DIR, INFERENCE_MODEL_PREFIX, bar_fmt, TEST_SGFS_ZIP, tqdm_kwargs
+from utils  import BOARD_SIZE, NUM_CHANNELS, w_policy_loss, w_value_loss, w_margin_loss
 
 train_logger = get_logger()
 
@@ -354,9 +355,9 @@ def save_inference_model(model, device, model_name):
     model.to(device)  # 元のデバイスに戻す
 
 # ==============================
-# 最良モデル保存用関数
+# 最良モデル保存用関数(Policy accurach)
 # ==============================
-def save_best_model(model, policy_accuracy, device, current_best_accuracy):
+def save_best_acc_model(model, policy_accuracy, device):
     """
     現在の policy_accuracy が最高値を更新したら：
       1) state_dict モデルを保存
@@ -366,15 +367,15 @@ def save_best_model(model, policy_accuracy, device, current_best_accuracy):
     """
     # ── 1) 新規ファイルパスを定義 ──
     new_model_file     = os.path.join(
-        MODEL_OUTPUT_DIR, f"model_{PREFIX}_{policy_accuracy:.5f}.pt"
+        MODEL_OUTPUT_DIR, f"model_{PREFIX}_acc_{policy_accuracy:.5f}.pt"
     )
     new_inference_file = os.path.join(
-        MODEL_OUTPUT_DIR, f"{INFERENCE_MODEL_PREFIX}_{policy_accuracy:.5f}.pt"
+        MODEL_OUTPUT_DIR, f"{INFERENCE_MODEL_PREFIX}_acc_{policy_accuracy:.5f}.pt"
     )
 
     # ── 2) モデル保存 ──
     torch.save(model.state_dict(), new_model_file)
-    train_logger.info(f"● New best model saved: {new_model_file}")
+    train_logger.info(f"● New best acc model saved: {new_model_file}")
 
     save_inference_model(model, device, os.path.basename(new_inference_file))
 
@@ -404,114 +405,112 @@ def save_best_model(model, policy_accuracy, device, current_best_accuracy):
                     except OSError as e:
                         train_logger.warning(f"Failed to delete {fname}: {e}")
 
-    # ── 4) 最新の最高精度を返す ──
-    return max(policy_accuracy, current_best_accuracy)
-
 # ==============================
-# モデル検証関数
+# モデル検証関数（mse_criterion 廃止版）
 # ==============================
 def validate_model(model, test_loader, device):
     """
-    テスト用データセットを用いて、モデルのpolicy accuracyを計算する関数。
-    各バッチごとに予測とターゲットの最大値インデックスの一致数をカウントし、全体の正解率を算出する。
-    """  
-    model.eval() 
+    高速＋ログ出力あり版 validate_model
+    - デバイス上で Tensor 累積（.item(), .to をループ外へ）
+    - プログレスバーは tqdm で維持
+    - 開始／終了ログ、経過時間、メトリクス出力を元と同じ形式で残す
+    """
+    model.eval()
 
-    total = 0
-    correct = 0
+    total_batches = len(test_loader)
+    total_samples = 0
 
-    # value/margin損失はデバイス上でTensorとして累積し、最後に同期して取り出す
-    total_value_loss  = torch.tensor(0.0, device=device)
-    total_margin_loss = torch.tensor(0.0, device=device)
-
-    # MSE を累積（reduction='sum' にして、後で batch サイズで割る）
-    criterion = torch.nn.MSELoss(reduction='sum')
-  
+    # 開始ログ
     start_time = time.time()
-    train_logger.info(f"[rank 0] validate_model: started with {len(test_loader)} batches")
+    train_logger.info(f"[rank 0] validate_model: started with {total_batches} batches")
 
-    # TPU 向けにデバイスローダー経由で非同期転送
-    val_device_loader = MpDeviceLoader(test_loader, device)
-    
-    with torch.no_grad():  # 評価時は勾配計算を行わない
-        for boards, target_policies, target_values, target_margins in tqdm(
-            val_device_loader,
-            desc="Validation", bar_format=bar_fmt, position=0, **tqdm_kwargs
+    # デバイス上で累積する Tensor
+    policy_sum = torch.zeros((), device=device)
+    value_sum  = torch.zeros((), device=device)
+    margin_sum = torch.zeros((), device=device)
+    correct    = torch.zeros((), device=device)
+
+    # 自動デバイス転送 loader
+    val_loader = MpDeviceLoader(test_loader, device)
+
+    with torch.no_grad():
+        for boards, t_policies, t_values, t_margins in tqdm(
+            val_loader,
+            desc="Validation",
+            bar_format=bar_fmt,
+            position=0,
+            **tqdm_kwargs
         ):
+            B = boards.size(0)
+            total_samples += B
 
             # 推論
-            pred_policies, (pred_values, pred_margins) = model(boards)
+            p_logits, (v_pred, m_pred) = model(boards)
 
-            # --- policy accuracy ---
-            _, predicted = pred_policies.max(dim=1)
-            _, labels    = target_policies.max(dim=1)
-            correct += (predicted == labels).sum().item()
-            batch_size = boards.size(0)
+            # accuracy
+            preds  = p_logits.argmax(dim=1)
+            labels = t_policies.argmax(dim=1)
+            correct += (preds == labels).sum()
 
-            # --- value MSE を Tensor 累積 ---
-            total_value_loss += criterion(
-                pred_values.view(-1), target_values.view(-1)
-            )
+            # 損失合計（sum reduction）
+            policy_sum += -(t_policies * p_logits).sum()
+            value_sum  += F.mse_loss(v_pred.view(-1), t_values.view(-1), reduction='sum')
+            margin_sum += F.mse_loss(m_pred.view(-1), t_margins.view(-1), reduction='sum')
 
-            # --- margin MSE を Tensor 累積 ---
-            total_margin_loss += criterion(
-                pred_margins.view(-1), target_margins.view(-1)
-            )
+            # XLA ステップ（TPUのみ）
+            if USE_TPU:
+                xm.mark_step()
 
-            # サンプル数カウント
-            total += batch_size
-            # パイプラインをフラッシュして一括実行
-            xm.mark_step()
-
-    # 平均化
-    policy_acc   = correct / total
-    value_mse    = total_value_loss.item()  / total
-    margin_mse   = total_margin_loss.item() / total
-
+    # 終了時間計測＆ログ
     elapsed = time.time() - start_time
-    minutes = int(elapsed // 60)
-    seconds = int(elapsed % 60)
-    train_logger.info(f"[rank 0] validation completed in {minutes}m{seconds}s")
-    train_logger.info(f"== Validation :policy accuracy:【{policy_acc:.5f}】 value_mse: {value_mse:.5f}, margin_mse: {margin_mse:.5f}")
+    m, s = divmod(int(elapsed), 60)
+  
+    # ホスト同期して平均・精度算出
+    avg_policy_loss = (policy_sum / total_samples).item()
+    avg_value_mse   = (value_sum  / total_samples).item()
+    avg_margin_mse  = (margin_sum / total_samples).item()
+    policy_acc      = (correct.float() / total_samples).item()
+    total_loss = w_policy_loss * avg_policy_loss + w_value_loss * avg_value_mse + w_margin_loss * avg_margin_mse
+
+    # メトリクスログ（元のフォーマットを踏襲）
+    train_logger.info(f"[rank 0] validation completed in {m}m{s}s")
+    train_logger.info(
+        f"== Validation : total loss: {total_loss:.5f}  policy accuracy:【{policy_acc:.5f}】 value_mse: {avg_value_mse:.5f}, margin_mse: {avg_margin_mse:.5f}"
+    )
 
     model.train()
 
-    return policy_acc, value_mse, margin_mse
+    return policy_acc, avg_value_mse, avg_margin_mse, total_loss
 
 # ==============================
-# チェックポイント保存＆復元関数
+# チェックポイント保存関数
 # ==============================
-def save_checkpoint(model, optimizer, scheduler, epoch, best_val_loss, epochs_no_improve, best_policy_accuracy, checkpoint_file, device, batch_idx, base_seed):
+def save_checkpoint(model, optimizer, scheduler, best_total_loss, best_policy_accuracy, checkpoint_file):
+
+    train_logger.info(f"Checkpoint saved start to {checkpoint_file}")
+
     checkpoint = {
-        'epoch': epoch,
         'model_state_dict': model.state_dict(),
         'optimizer_state_dict': optimizer.state_dict(),
         'scheduler_state_dict': scheduler.state_dict(),  # スケジューラ状態の保存
-        'best_val_loss': best_val_loss,
-        'epochs_no_improve': epochs_no_improve,
-        'best_policy_accuracy': best_policy_accuracy,
-        'batch_idx': batch_idx,
-        'base_seed': base_seed
+        'best_total_loss': best_total_loss, # トータルロスベースのベスト保存
+        'best_policy_accuracy': best_policy_accuracy # 精度ベースのベスト保存
     }
     torch.save(checkpoint, checkpoint_file)
-    train_logger.info(f"Checkpoint saved at epoch {epoch} to {checkpoint_file}")
+
+    train_logger.info(f"Checkpoint saved end to {checkpoint_file}")
 
 # 訓練中のコンソール表示が崩れないように、ログ出力はしないバージョン
-def save_checkpoint_nolog(model, optimizer, scheduler, epoch, best_val_loss, epochs_no_improve, best_policy_accuracy, checkpoint_file, device,
-batch_idx, base_seed):
+def save_checkpoint_nolog(model, optimizer, scheduler, best_total_loss, best_policy_accuracy, checkpoint_file):
     """
-    訓練中のコンソール表示を行わない版チェックポイント保存。
+    訓練中のコンソール表示を行わない版チェックポイント保存
     """
     checkpoint = {
-        'epoch': epoch,
         'model_state_dict': model.state_dict(),
         'optimizer_state_dict': optimizer.state_dict(),
         'scheduler_state_dict': scheduler.state_dict(),
-        'best_val_loss': best_val_loss,
-        'epochs_no_improve': epochs_no_improve,
-        'best_policy_accuracy': best_policy_accuracy,
-        'batch_idx': batch_idx,
-        'base_seed': base_seed
+        'best_total_loss': best_total_loss,
+        'best_policy_accuracy': best_policy_accuracy
     }
     torch.save(checkpoint, checkpoint_file)
 
@@ -528,6 +527,9 @@ def recursive_to(data, device):
     else:
         return data
 
+# ==============================
+# チェックポイント復元関数
+# ==============================
 def load_checkpoint(model, optimizer, scheduler, checkpoint_file, device):
 
     if os.path.exists(checkpoint_file):
@@ -540,14 +542,18 @@ def load_checkpoint(model, optimizer, scheduler, checkpoint_file, device):
         # スケジューラ状態の復元を追加
         if scheduler is not None and 'scheduler_state_dict' in checkpoint:
             scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-        epoch = checkpoint.get('epoch', 0)
+               
+        # トータルロスベースのベストを読み込み（存在しなければ inf）
+        best_total_loss = checkpoint.get('best_total_loss', 10.0)
+
+        # 精度ベースのベストを読み込み（存在しなければ 0.0）
         best_policy_accuracy = checkpoint.get('best_policy_accuracy', 0.0)
-        batch_idx = checkpoint.get('batch_idx', -1)
-        base_seed  = checkpoint.get('base_seed', None)
-        return epoch, best_policy_accuracy, batch_idx, base_seed
+               
+        return  best_total_loss, best_policy_accuracy  
     else:
         train_logger.info("No checkpoint found. Starting from scratch.")
-        return 0, 0.0, -1, None
+        
+        return  10.0, 0.0
 
 # ==============================
 # Test用データセット生成（zip利用）
