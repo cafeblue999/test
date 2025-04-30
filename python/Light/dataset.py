@@ -218,6 +218,51 @@ class AlphaZeroSGFDatasetPreloaded(Dataset):
         return board_tensor, target_policy_tensor, target_value_tensor, target_margin_tensor
 
 # ==============================
+# Test用データセット生成（zip利用）
+# ==============================
+def prepare_test_dataset(sgf_dir, board_size, history_length, augment_all, output_file):
+    """
+    テスト用データセットを生成する関数
+    ・既にpickleファイルが存在する場合はそれをロードし、無ければSGFファイルからzipを作成してサンプル生成
+    ・生成したサンプルはpickle形式で保存する
+    """
+    if os.path.exists(output_file):
+        train_logger.info(f"Test dataset pickle {output_file} already exists. Loading it directly...")
+        return load_dataset(output_file)
+
+    if not os.path.exists(TEST_SGFS_ZIP):
+        train_logger.info(f"Creating zip archive {TEST_SGFS_ZIP} from SGF files in {sgf_dir} ...")
+        sgf_files = [os.path.join(sgf_dir, f) for f in os.listdir(sgf_dir)
+                     if f.endswith('.sgf') and "analyzed" not in f.lower()]
+        with zipfile.ZipFile(TEST_SGFS_ZIP, 'w') as zf:
+            for filepath in sgf_files:
+                zf.write(filepath, arcname=os.path.basename(filepath))
+        train_logger.info(f"Zip archive created: {TEST_SGFS_ZIP}")
+    else:
+        train_logger.info(f"Zip archive {TEST_SGFS_ZIP} already exists. Loading from it...")
+
+    all_samples = []
+
+    with zipfile.ZipFile(TEST_SGFS_ZIP, 'r') as zf:
+        # SGFファイルの名前リストを取得
+        sgf_names = [name for name in zf.namelist() if name.endswith('.sgf') and "analyzed" not in name.lower()]
+        sgf_names.sort()  # 名前順にソート
+        train_logger.info(f"TEST: Total SGF files in zip to process: {len(sgf_names)}")
+        for name in tqdm(sgf_names, desc="Processing TEST SGF files"):
+            try:
+                sgf_src = zf.read(name).decode('utf-8')
+                file_samples = process_sgf_to_samples_from_text(sgf_src, board_size, history_length, augment_all=False)
+                all_samples.extend(file_samples)
+            except Exception as e:
+                train_logger.error(f"Error processing {name} from zip: {e}")
+
+    # 生成されたサンプルをpickleファイルに保存
+    save_dataset(all_samples, output_file)
+    train_logger.info(f"TEST: Saved test dataset (total samples: {len(all_samples)}) to {output_file}")
+
+    return all_samples
+
+# ==============================
 # SGFからサンプル生成関数
 # ==============================
 def process_sgf_to_samples_from_text(sgf_src, board_size, history_length, augment_all):
@@ -365,7 +410,7 @@ def save_best_acc_model(model, policy_accuracy, device):
       3) 古いスコア付きファイルを一掃
       4) 最新の最高値を返す
     """
-    # ── 1) 新規ファイルパスを定義 ──
+    # 1) 新規ファイルパスを定義
     new_model_file     = os.path.join(
         MODEL_OUTPUT_DIR, f"model_{PREFIX}_acc_{policy_accuracy:.5f}.pt"
     )
@@ -373,13 +418,13 @@ def save_best_acc_model(model, policy_accuracy, device):
         MODEL_OUTPUT_DIR, f"{INFERENCE_MODEL_PREFIX}_acc_{policy_accuracy:.5f}.pt"
     )
 
-    # ── 2) モデル保存 ──
+    # 2) モデル保存
     torch.save(model.state_dict(), new_model_file)
     train_logger.info(f"● New best acc model saved: {new_model_file}")
 
     save_inference_model(model, device, os.path.basename(new_inference_file))
 
-    # ── 3) 古いスコア付きファイルを一掃 ──
+    # 3) 古いスコア付きファイルを一掃
     pattern = re.compile(r'^(?P<prefix>.+_)(?P<score>\d+\.\d+)\.pt$')
 
     groups = {}
@@ -391,19 +436,25 @@ def save_best_acc_model(model, policy_accuracy, device):
         score  = float(m.group('score'))  # ex. 0.34118
         groups.setdefault(prefix, []).append((fname, score))
 
+    # accモデルのみ削除対象に限定
     for prefix, flist in groups.items():
+        # “_acc_” プレフィックス以外はスキップ
+        if not prefix.endswith("_acc_"):
+            continue
+
         # 各プレフィックスで最大スコアを計算
         max_score = max(score for _, score in flist)
         for fname, score in flist:
             if score < max_score:
                 path = os.path.join(MODEL_OUTPUT_DIR, fname)
                 # 新たに保存した model/inference ファイルだけは残す
-                if path not in (new_model_file, new_inference_file):
-                    try:
-                        os.remove(path)
-                        train_logger.info(f"Deleted old file: {fname}")
-                    except OSError as e:
-                        train_logger.warning(f"Failed to delete {fname}: {e}")
+                if fname in (os.path.basename(new_model_file), os.path.basename(new_inference_file)):
+                    continue
+                try:
+                    os.remove(path)
+                    train_logger.info(f"Deleted old file: {fname}")
+                except OSError as e:
+                    train_logger.warning(f"Failed to delete {fname}: {e}")
 
 # ==============================
 # 最良モデル保存用関数(total loss)
@@ -416,7 +467,7 @@ def save_best_loss_model(model, total_loss, device):
       3) 古いスコア付きファイルを一掃
       4) 最新の最高値を返す
     """
-    # ── 1) 新規ファイルパスを定義 ──
+    # 1) 新規ファイルパスを定義 
     new_model_file     = os.path.join(
         MODEL_OUTPUT_DIR, f"model_{PREFIX}_loss_{total_loss:.5f}.pt"
     )
@@ -424,13 +475,13 @@ def save_best_loss_model(model, total_loss, device):
         MODEL_OUTPUT_DIR, f"{INFERENCE_MODEL_PREFIX}_loss_{total_loss:.5f}.pt"
     )
 
-    # ── 2) モデル保存 ──
+    # 2) モデル保存
     torch.save(model.state_dict(), new_model_file)
     train_logger.info(f"● New best loss model saved: {new_model_file}")
 
     save_inference_model(model, device, os.path.basename(new_inference_file))
 
-    # ── 3) 古いスコア付きファイルを一掃 ──
+    # 3) 古いスコア付きファイルを一掃
     pattern = re.compile(r'^(?P<prefix>.+_)(?P<score>\d+\.\d+)\.pt$')
 
     groups = {}
@@ -442,23 +493,28 @@ def save_best_loss_model(model, total_loss, device):
         score  = float(m.group('score'))  # ex. 0.34118
         groups.setdefault(prefix, []).append((fname, score))
 
+    # 「新しく保存したファイル名」のみを絶対に残すセットを作る
+    keep_fnames = {
+        os.path.basename(new_model_file),
+        os.path.basename(new_inference_file),
+    }
+    # lossモデルのみ削除対象に限定 
     for prefix, flist in groups.items():
-        # 各プレフィックスで最大スコアを計算
-        max_score = max(score for _, score in flist)
+        # “_loss_” プレフィックス以外はスキップ
+        if not prefix.endswith("_loss_"):
+            continue
+        # 各プレフィックスで最小スコア（最良モデル）を計算
+        min_score = min(score for _, score in flist)
         for fname, score in flist:
-            if score < max_score:
+            # スコアが最小より大きい（損失が悪化している）かつ、新規モデルでなければ削除
+            if score > min_score and fname not in keep_fnames:
                 path = os.path.join(MODEL_OUTPUT_DIR, fname)
-                # 新たに保存した model/inference ファイルだけは残す
-                if path not in (new_model_file, new_inference_file):
-                    try:
-                        os.remove(path)
-                        train_logger.info(f"Deleted old file: {fname}")
-                    except OSError as e:
-                        train_logger.warning(f"Failed to delete {fname}: {e}")
+                try:
+                    os.remove(path)
+                    train_logger.info(f"Deleted old file: {fname}")
+                except OSError as e:
+                    train_logger.warning(f"Failed to delete {fname}: {e}")
 
-# ==============================
-# モデル検証関数（修正版）
-# ==============================
 # ==============================
 # モデル検証関数（mse_criterion 廃止版）
 # ==============================
@@ -609,48 +665,4 @@ def load_checkpoint(model, optimizer, scheduler, checkpoint_file, device):
         
         return  10.0, 0.0
 
-# ==============================
-# Test用データセット生成（zip利用）
-# ==============================
-def prepare_test_dataset(sgf_dir, board_size, history_length, augment_all, output_file):
-    """
-    テスト用データセットを生成する関数
-    ・既にpickleファイルが存在する場合はそれをロードし、無ければSGFファイルからzipを作成してサンプル生成
-    ・生成したサンプルはpickle形式で保存する
-    """
-    if os.path.exists(output_file):
-        train_logger.info(f"Test dataset pickle {output_file} already exists. Loading it directly...")
-        return load_dataset(output_file)
-
-    if not os.path.exists(TEST_SGFS_ZIP):
-        train_logger.info(f"Creating zip archive {TEST_SGFS_ZIP} from SGF files in {sgf_dir} ...")
-        sgf_files = [os.path.join(sgf_dir, f) for f in os.listdir(sgf_dir)
-                     if f.endswith('.sgf') and "analyzed" not in f.lower()]
-        with zipfile.ZipFile(TEST_SGFS_ZIP, 'w') as zf:
-            for filepath in sgf_files:
-                zf.write(filepath, arcname=os.path.basename(filepath))
-        train_logger.info(f"Zip archive created: {TEST_SGFS_ZIP}")
-    else:
-        train_logger.info(f"Zip archive {TEST_SGFS_ZIP} already exists. Loading from it...")
-
-    all_samples = []
-
-    with zipfile.ZipFile(TEST_SGFS_ZIP, 'r') as zf:
-        # SGFファイルの名前リストを取得
-        sgf_names = [name for name in zf.namelist() if name.endswith('.sgf') and "analyzed" not in name.lower()]
-        sgf_names.sort()  # 名前順にソート
-        train_logger.info(f"TEST: Total SGF files in zip to process: {len(sgf_names)}")
-        for name in tqdm(sgf_names, desc="Processing TEST SGF files"):
-            try:
-                sgf_src = zf.read(name).decode('utf-8')
-                file_samples = process_sgf_to_samples_from_text(sgf_src, board_size, history_length, augment_all=False)
-                all_samples.extend(file_samples)
-            except Exception as e:
-                train_logger.error(f"Error processing {name} from zip: {e}")
-
-    # 生成されたサンプルをpickleファイルに保存
-    save_dataset(all_samples, output_file)
-    train_logger.info(f"TEST: Saved test dataset (total samples: {len(all_samples)}) to {output_file}")
-
-    return all_samples
 

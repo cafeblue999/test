@@ -54,16 +54,33 @@ def train_one_iteration(model, train_loader, optimizer, device, local_loop_cnt, 
     model.train()
 
     total_loss = total_policy = total_value = total_margin = 0.0
+    
+    # ログ用ファイルをバッチ外で一度だけオープン
+    policy_log_f = None
+    value_log_f  = None
+    if rank == 0:
+        policy_log_f = open(
+            os.path.join(LOSS_LOG_DIR, "weighted_policy_loss.log"),
+            "a", encoding="utf-8"
+        )
+        value_log_f = open(
+            os.path.join(LOSS_LOG_DIR, "weighted_value_loss.log"),
+            "a", encoding="utf-8"
+        )
+    
     overall_correct = overall_samples = 0
     total_batches = len(train_loader)
     log_interval = max(1, total_batches // 10)  # 10% ごとにログ
 
-    for i, (boards, target_policies, target_values, target_margins) in enumerate(train_loader, start=1):
-        
-        boards = boards.to(device)
-        target_policies = target_policies.to(device)
-        target_values = target_values.to(device)
-        target_margins = target_margins.to(device)
+    for i, batch in enumerate(train_loader, start=1):
+        # unpack batch
+        boards, target_policies, target_values, target_margins = batch
+
+        # 非同期転送
+        boards          = boards.to(device, non_blocking=True)
+        target_policies = target_policies.to(device, non_blocking=True)
+        target_values   = target_values.to(device, non_blocking=True)
+        target_margins  = target_margins.to(device, non_blocking=True)
 
         # 順伝播→損失計算
         pred_policy, (pred_value, pred_margin) = model(boards)
@@ -72,18 +89,15 @@ def train_one_iteration(model, train_loader, optimizer, device, local_loop_cnt, 
         margin_loss = F.mse_loss(pred_margin.view(-1), target_margins.view(-1))
         loss = w_policy_loss * policy_loss + w_value_loss * value_loss + w_margin_loss * margin_loss
 
-        # ── weighted loss のログ追記 ──
+        # weighted loss のログ追記 ──
         if rank == 0:
-            weighted_policy_loss = w_policy_loss * policy_loss.item()
-            weighted_value_loss  = w_value_loss  * value_loss.item()
             ts = datetime.datetime.now(jst).strftime("%Y-%m-%d %H:%M:%S")
-            # policy loss
-            with open(os.path.join(LOSS_LOG_DIR, "weighted_policy_loss.log"), "a", encoding="utf-8") as f:
-                f.write(f"{ts},{local_loop_cnt},{i},{weighted_policy_loss:.6f}\n")
-            # value loss
-            with open(os.path.join(LOSS_LOG_DIR, "weighted_value_loss.log"), "a", encoding="utf-8") as f:
-                f.write(f"{ts},{local_loop_cnt},{i},{weighted_value_loss:.6f}\n")
-        # ─────────────────────────────────
+            policy_log_f.write(
+                f"{ts},{local_loop_cnt},{i},{(w_policy_loss*policy_loss).item():.6f}\n"
+            )
+            value_log_f.write(
+                f"{ts},{local_loop_cnt},{i},{(w_value_loss*value_loss).item():.6f}\n"
+            )
 
         if not torch.isfinite(loss):
             train_logger.error(f"[rank {rank}] Invalid loss: {loss}. Skipping this batch.")
@@ -119,6 +133,8 @@ def train_one_iteration(model, train_loader, optimizer, device, local_loop_cnt, 
         avg_loss = total_loss / len(train_loader)
         acc = overall_correct / overall_samples
         train_logger.info(f"[rank {rank}] Epoch {local_loop_cnt}: iteration done. loss={avg_loss:.5f}, acc={acc:.5f}")
+        policy_log_f.close()
+        value_log_f.close()
     
     return total_loss / len(train_loader)
 
@@ -157,20 +173,17 @@ def _mp_fn(rank):
     # 最良精度の初期化
     best_policy_accuracy = 0.0
 
-    # 全ファイル読み込み
+    # 全ファイル読み込み (ZIP をループ外でオープン)
     zip_path = os.path.join(TRAIN_SGF_DIR, 'train.zip')
-
+    zip_ref  = zipfile.ZipFile(zip_path, 'r')
     all_files = []
-
-    with zipfile.ZipFile(zip_path, 'r') as zip_ref:
-        # .sgfファイルのうち "analyzed" を含まないファイルを対象
-        sgf_files = [
-            (zip_path, name)
-            for name in zip_ref.namelist()
-            if name.endswith('.sgf') and "analyzed" not in name.lower()
-        ]
-        all_files.extend(sgf_files)
-            
+    # .sgfファイルのうち "analyzed" を含まないものを一覧化
+    sgf_files = [
+        (zip_path, name)
+        for name in zip_ref.namelist()
+        if name.endswith('.sgf') and "analyzed" not in name.lower()
+    ]
+    all_files.extend(sgf_files)           
     train_logger.info(f"[rank {rank}] Available {len(all_files)} SGF files (shared across all ranks)")
     
     local_loop_cnt = 0
@@ -226,14 +239,14 @@ def _mp_fn(rank):
 
         # SGF→サンプル生成
         samples = []
-        # selected は [(zip_path, entry_name), ...] のリストなので、展開して読み込む
+        # selected は [(zip_path, entry_name), ...]
         for zip_path, entry_name in selected:
-            with zipfile.ZipFile(zip_path, 'r') as zf:
-            # バイナリとして読み込んだ後、文字列に
-                sgf_src = zf.read(entry_name).decode('utf-8')
-                samples.extend(process_sgf_to_samples_from_text(
+            # ループ外でオープン済みの zip_ref を利用
+            sgf_src = zip_ref.read(entry_name).decode('utf-8')
+            samples.extend(process_sgf_to_samples_from_text(
                 sgf_src, BOARD_SIZE, HISTORY_LENGTH, augment_all=False
             ))
+
         if not samples:
             train_logger.warning(f"[rank {rank}] No samples generated. Skipping epoch {local_loop_cnt}.")
             local_loop_cnt += 1
@@ -278,6 +291,8 @@ def _mp_fn(rank):
                 save_inference_model(model, device, f"{INFERENCE_MODEL_PREFIX}_loss_tmp.pt")
 
             if policy_acc > best_policy_accuracy:
+                train_logger.info(f"[rank {rank}] _mp_fn: total_loss {best_policy_accuracy:.5f} → {policy_acc:.5f}" )
+                best_policy_accuracy = policy_acc
                 save_best_acc_model(model, policy_acc, device)
             else:
                 save_inference_model(model, device, f"{INFERENCE_MODEL_PREFIX}_acc_tmp.pt")
@@ -295,11 +310,14 @@ def _mp_fn(rank):
 
             # チェックポイント保存
             save_checkpoint(model, optimizer, scheduler, best_total_loss, best_policy_accuracy, CHECKPOINT_FILE)
-            train_logger.info(f"[rank {rank}] Epoch {local_loop_cnt} completed. best_acc={best_policy_accuracy:.5f}")
+            train_logger.info(f"[rank {rank}] Epoch {local_loop_cnt} completed.")
 
         del model, optimizer, scheduler, samples, train_dataset, train_loader, train_device_loader
         gc.collect()
         xm.mark_step()
+        
+    # ループ外で ZIP をクローズ(上記は現状では無限ループなので到達しない)
+    zip_ref.close()
 
 # ==============================
 # main処理
