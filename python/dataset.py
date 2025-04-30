@@ -1,16 +1,19 @@
 import os
 import re
 import time
+import datetime
 import pickle
 import zipfile
+import pytz
 import numpy as np
 import torch
+import torch.nn.functional as F
 import torch_xla.core.xla_model as xm
 from torch_xla.distributed.parallel_loader import MpDeviceLoader
 from torch.utils.data import Dataset
 from tqdm import tqdm
-from config import get_logger, PREFIX, MODEL_OUTPUT_DIR, INFERENCE_MODEL_PREFIX, bar_fmt, TEST_SGFS_ZIP, tqdm_kwargs
-from utils  import BOARD_SIZE, NUM_CHANNELS
+from config import USE_TPU, get_logger, PREFIX, MODEL_OUTPUT_DIR, INFERENCE_MODEL_PREFIX, bar_fmt, TEST_SGFS_ZIP, tqdm_kwargs, LOSS_LOG_DIR, JST, COUNTS_FILE
+from utils  import BOARD_SIZE, NUM_CHANNELS, w_policy_loss, w_value_loss, w_margin_loss
 
 train_logger = get_logger()
 
@@ -200,21 +203,95 @@ class AlphaZeroSGFDatasetPreloaded(Dataset):
     前処理済みのSGFサンプルをメモリ上に保持するDatasetクラス。
     各サンプルは、flattenした盤面の配列、ターゲットポリシー、ターゲット値、ターゲットマージンからなる。
     """
-    def __init__(self, samples):
+    def __init__(self, samples, file_list) :
         self.samples = samples
+        # ここで train.py 側から渡されたファイル情報を保持
+        self.file_list   = file_list 
+
+        # ── ファイル処理カウンタの読み込み or 初期化 ──
+        if os.path.exists(COUNTS_FILE):
+            with open(COUNTS_FILE, "rb") as f:
+                saved = pickle.load(f)
+            # 現在の file_list のみに絞ってカウントを復元 or 0 初期化
+            self.file_process_counts = {
+                fp: saved.get(fp, 0)
+                for fp in self.file_list
+            }
+        else:
+            self.file_process_counts = {fp: 0 for fp in self.file_list}
 
     def __len__(self):
         return len(self.samples)
 
     def __getitem__(self, idx):
-        # サンプルは (入力, ポリシー, 値, マージン) の順番となっている
-        inp, pol, val, mar = self.samples[idx]
-        # 入力盤面をテンソルに変換し、[チャネル数 x 盤面サイズ x 盤面サイズ]の形状にリシェイプ
-        board_tensor = torch.tensor(inp, dtype=torch.float32).view(NUM_CHANNELS, BOARD_SIZE, BOARD_SIZE)
+        """
+        訓練用サンプル（5要素）とテスト用サンプル（4要素）の両方を扱います。
+        file_process_counts の更新は train.py 側で行うため、ここでは副作用を持たせません。
+        常に4要素のテンソルを返します。
+        """
+        item = self.samples[idx]
+        if len(item) == 5:
+            inp, pol, val, mar, _ = item
+        else:
+            inp, pol, val, mar = item
+
+        board_tensor         = torch.tensor(inp, dtype=torch.float32).view(NUM_CHANNELS, BOARD_SIZE, BOARD_SIZE)
         target_policy_tensor = torch.tensor(pol, dtype=torch.float32)
-        target_value_tensor = torch.tensor(val, dtype=torch.float32)
+        target_value_tensor  = torch.tensor(val, dtype=torch.float32)
         target_margin_tensor = torch.tensor(mar, dtype=torch.float32)
+
         return board_tensor, target_policy_tensor, target_value_tensor, target_margin_tensor
+    
+    def save_file_counts(self):
+        """ファイル処理回数をディスクに保存"""
+        os.makedirs(os.path.dirname(COUNTS_FILE), exist_ok=True)
+        with open(COUNTS_FILE, "wb") as f:
+            pickle.dump(self.file_process_counts, f)
+
+# ==============================
+# Test用データセット生成（zip利用）
+# ==============================
+def prepare_test_dataset(sgf_dir, board_size, history_length, augment_all, output_file):
+    """
+    テスト用データセットを生成する関数
+    ・既にpickleファイルが存在する場合はそれをロードし、無ければSGFファイルからzipを作成してサンプル生成
+    ・生成したサンプルはpickle形式で保存する
+    """
+    if os.path.exists(output_file):
+        train_logger.info(f"Test dataset pickle {output_file} already exists. Loading it directly...")
+        return load_dataset(output_file)
+
+    if not os.path.exists(TEST_SGFS_ZIP):
+        train_logger.info(f"Creating zip archive {TEST_SGFS_ZIP} from SGF files in {sgf_dir} ...")
+        sgf_files = [os.path.join(sgf_dir, f) for f in os.listdir(sgf_dir)
+                     if f.endswith('.sgf') and "analyzed" not in f.lower()]
+        with zipfile.ZipFile(TEST_SGFS_ZIP, 'w') as zf:
+            for filepath in sgf_files:
+                zf.write(filepath, arcname=os.path.basename(filepath))
+        train_logger.info(f"Zip archive created: {TEST_SGFS_ZIP}")
+    else:
+        train_logger.info(f"Zip archive {TEST_SGFS_ZIP} already exists. Loading from it...")
+
+    all_samples = []
+
+    with zipfile.ZipFile(TEST_SGFS_ZIP, 'r') as zf:
+        # SGFファイルの名前リストを取得
+        sgf_names = [name for name in zf.namelist() if name.endswith('.sgf') and "analyzed" not in name.lower()]
+        sgf_names.sort()  # 名前順にソート
+        train_logger.info(f"TEST: Total SGF files in zip to process: {len(sgf_names)}")
+        for name in tqdm(sgf_names, desc="Processing TEST SGF files"):
+            try:
+                sgf_src = zf.read(name).decode('utf-8')
+                file_samples = process_sgf_to_samples_from_text(sgf_src, board_size, history_length, augment_all=False)
+                all_samples.extend(file_samples)
+            except Exception as e:
+                train_logger.error(f"Error processing {name} from zip: {e}")
+
+    # 生成されたサンプルをpickleファイルに保存
+    save_dataset(all_samples, output_file)
+    train_logger.info(f"TEST: Saved test dataset (total samples: {len(all_samples)}) to {output_file}")
+
+    return all_samples
 
 # ==============================
 # SGFからサンプル生成関数
@@ -354,9 +431,9 @@ def save_inference_model(model, device, model_name):
     model.to(device)  # 元のデバイスに戻す
 
 # ==============================
-# 最良モデル保存用関数
+# 最良モデル保存用関数(Policy accurach)
 # ==============================
-def save_best_model(model, policy_accuracy, device, current_best_accuracy):
+def save_best_acc_model(model, policy_accuracy, device):
     """
     現在の policy_accuracy が最高値を更新したら：
       1) state_dict モデルを保存
@@ -364,21 +441,21 @@ def save_best_model(model, policy_accuracy, device, current_best_accuracy):
       3) 古いスコア付きファイルを一掃
       4) 最新の最高値を返す
     """
-    # ── 1) 新規ファイルパスを定義 ──
+    # 1) 新規ファイルパスを定義
     new_model_file     = os.path.join(
-        MODEL_OUTPUT_DIR, f"model_{PREFIX}_{policy_accuracy:.5f}.pt"
+        MODEL_OUTPUT_DIR, f"model_{PREFIX}_acc_{policy_accuracy:.5f}.pt"
     )
     new_inference_file = os.path.join(
-        MODEL_OUTPUT_DIR, f"{INFERENCE_MODEL_PREFIX}_{policy_accuracy:.5f}.pt"
+        MODEL_OUTPUT_DIR, f"{INFERENCE_MODEL_PREFIX}_acc_{policy_accuracy:.5f}.pt"
     )
 
-    # ── 2) モデル保存 ──
+    # 2) モデル保存
     torch.save(model.state_dict(), new_model_file)
-    train_logger.info(f"● New best model saved: {new_model_file}")
+    train_logger.info(f"● New best acc model saved: {new_model_file}")
 
     save_inference_model(model, device, os.path.basename(new_inference_file))
 
-    # ── 3) 古いスコア付きファイルを一掃 ──
+    # 3) 古いスコア付きファイルを一掃
     pattern = re.compile(r'^(?P<prefix>.+_)(?P<score>\d+\.\d+)\.pt$')
 
     groups = {}
@@ -390,128 +467,209 @@ def save_best_model(model, policy_accuracy, device, current_best_accuracy):
         score  = float(m.group('score'))  # ex. 0.34118
         groups.setdefault(prefix, []).append((fname, score))
 
+    # accモデルのみ削除対象に限定
     for prefix, flist in groups.items():
+        # “_acc_” プレフィックス以外はスキップ
+        if not prefix.endswith("_acc_"):
+            continue
+
         # 各プレフィックスで最大スコアを計算
         max_score = max(score for _, score in flist)
         for fname, score in flist:
             if score < max_score:
                 path = os.path.join(MODEL_OUTPUT_DIR, fname)
                 # 新たに保存した model/inference ファイルだけは残す
-                if path not in (new_model_file, new_inference_file):
-                    try:
-                        os.remove(path)
-                        train_logger.info(f"Deleted old file: {fname}")
-                    except OSError as e:
-                        train_logger.warning(f"Failed to delete {fname}: {e}")
-
-    # ── 4) 最新の最高精度を返す ──
-    return max(policy_accuracy, current_best_accuracy)
+                if fname in (os.path.basename(new_model_file), os.path.basename(new_inference_file)):
+                    continue
+                try:
+                    os.remove(path)
+                    train_logger.info(f"Deleted old file: {fname}")
+                except OSError as e:
+                    train_logger.warning(f"Failed to delete {fname}: {e}")
 
 # ==============================
-# モデル検証関数
+# 最良モデル保存用関数(total loss)
+# ==============================
+def save_best_loss_model(model, total_loss, device):
+    """
+    現在の policy_accuracy が最高値を更新したら：
+      1) state_dict モデルを保存
+      2) 推論モデルを保存
+      3) 古いスコア付きファイルを一掃
+      4) 最新の最高値を返す
+    """
+    # 1) 新規ファイルパスを定義 
+    new_model_file     = os.path.join(
+        MODEL_OUTPUT_DIR, f"model_{PREFIX}_loss_{total_loss:.5f}.pt"
+    )
+    new_inference_file = os.path.join(
+        MODEL_OUTPUT_DIR, f"{INFERENCE_MODEL_PREFIX}_loss_{total_loss:.5f}.pt"
+    )
+
+    # 2) モデル保存
+    torch.save(model.state_dict(), new_model_file)
+    train_logger.info(f"● New best loss model saved: {new_model_file}")
+
+    save_inference_model(model, device, os.path.basename(new_inference_file))
+
+    # 3) 古いスコア付きファイルを一掃
+    pattern = re.compile(r'^(?P<prefix>.+_)(?P<score>\d+\.\d+)\.pt$')
+
+    groups = {}
+    for fname in os.listdir(MODEL_OUTPUT_DIR):
+        m = pattern.match(fname)
+        if not m:
+            continue
+        prefix = m.group('prefix')        # ex. "model_ALL_" or "inference_ALL_"
+        score  = float(m.group('score'))  # ex. 0.34118
+        groups.setdefault(prefix, []).append((fname, score))
+
+    # 「新しく保存したファイル名」のみを絶対に残すセットを作る
+    keep_fnames = {
+        os.path.basename(new_model_file),
+        os.path.basename(new_inference_file),
+    }
+    # lossモデルのみ削除対象に限定 
+    for prefix, flist in groups.items():
+        # “_loss_” プレフィックス以外はスキップ
+        if not prefix.endswith("_loss_"):
+            continue
+        # 各プレフィックスで最小スコア（最良モデル）を計算
+        min_score = min(score for _, score in flist)
+        for fname, score in flist:
+            # スコアが最小より大きい（損失が悪化している）かつ、新規モデルでなければ削除
+            if score > min_score and fname not in keep_fnames:
+                path = os.path.join(MODEL_OUTPUT_DIR, fname)
+                try:
+                    os.remove(path)
+                    train_logger.info(f"Deleted old file: {fname}")
+                except OSError as e:
+                    train_logger.warning(f"Failed to delete {fname}: {e}")
+
+# ==============================
+# モデル検証関数（mse_criterion 廃止版）
 # ==============================
 def validate_model(model, test_loader, device):
     """
-    テスト用データセットを用いて、モデルのpolicy accuracyを計算する関数。
-    各バッチごとに予測とターゲットの最大値インデックスの一致数をカウントし、全体の正解率を算出する。
-    """  
-    model.eval() 
+    高速＋ログ出力あり版 validate_model
+    - デバイス上で Tensor 累積（.item(), .to をループ外へ）
+    - プログレスバーは tqdm で維持
+    - 開始／終了ログ、経過時間、メトリクス出力を元と同じ形式で残す
+    """
+    model.eval()
 
-    total = 0
-    correct = 0
+    total_batches = len(test_loader)
+    total_samples = 0
 
-    # value/margin損失はデバイス上でTensorとして累積し、最後に同期して取り出す
-    total_value_loss  = torch.tensor(0.0, device=device)
-    total_margin_loss = torch.tensor(0.0, device=device)
-
-    # MSE を累積（reduction='sum' にして、後で batch サイズで割る）
-    criterion = torch.nn.MSELoss(reduction='sum')
-  
+    # 開始ログ
     start_time = time.time()
-    train_logger.info(f"[rank 0] validate_model: started with {len(test_loader)} batches")
+    train_logger.info(f"[rank 0] validate_model: started with {total_batches} batches")
 
-    # TPU 向けにデバイスローダー経由で非同期転送
-    val_device_loader = MpDeviceLoader(test_loader, device)
-    
-    with torch.no_grad():  # 評価時は勾配計算を行わない
-        for boards, target_policies, target_values, target_margins in tqdm(
-            val_device_loader,
-            desc="Validation", bar_format=bar_fmt, position=0, **tqdm_kwargs
+    # デバイス上で累積する Tensor
+    policy_sum = torch.zeros((), device=device)
+    value_sum  = torch.zeros((), device=device)
+    margin_sum = torch.zeros((), device=device)
+    correct    = torch.zeros((), device=device)
+
+    # 自動デバイス転送 loader
+    val_loader = MpDeviceLoader(test_loader, device)
+
+    with torch.no_grad():
+        for boards, t_policies, t_values, t_margins in tqdm(
+            val_loader,
+            desc="Validation",
+            bar_format=bar_fmt,
+            position=0,
+            **tqdm_kwargs
         ):
+            # --- デバイス転送 ---
+            boards        = boards.to(device,      non_blocking=True)
+            t_policies    = t_policies.to(device,  non_blocking=True)
+            t_values      = t_values.to(device,    non_blocking=True)
+            t_margins     = t_margins.to(device,   non_blocking=True)
+
+            B = boards.size(0)
+            total_samples += B
 
             # 推論
-            pred_policies, (pred_values, pred_margins) = model(boards)
+            p_logits, (v_pred, m_pred) = model(boards)
 
-            # --- policy accuracy ---
-            _, predicted = pred_policies.max(dim=1)
-            _, labels    = target_policies.max(dim=1)
-            correct += (predicted == labels).sum().item()
-            batch_size = boards.size(0)
+            # accuracy
+            preds  = p_logits.argmax(dim=1)
+            labels = t_policies.argmax(dim=1)
+            correct += (preds == labels).sum()
 
-            # --- value MSE を Tensor 累積 ---
-            total_value_loss += criterion(
-                pred_values.view(-1), target_values.view(-1)
-            )
+            # 損失合計（sum reduction）
+            policy_sum += F.nll_loss(p_logits, labels, reduction='sum')
+            value_sum  += F.mse_loss(v_pred.view(-1), t_values.view(-1), reduction='sum')
+            margin_sum += F.mse_loss(m_pred.view(-1), t_margins.view(-1), reduction='sum')
 
-            # --- margin MSE を Tensor 累積 ---
-            total_margin_loss += criterion(
-                pred_margins.view(-1), target_margins.view(-1)
-            )
+            # XLA ステップ（TPUのみ）
+            if USE_TPU:
+                xm.mark_step()
 
-            # サンプル数カウント
-            total += batch_size
-            # パイプラインをフラッシュして一括実行
-            xm.mark_step()
-
-    # 平均化
-    policy_acc   = correct / total
-    value_mse    = total_value_loss.item()  / total
-    margin_mse   = total_margin_loss.item() / total
-
+    # 終了時間計測＆ログ
     elapsed = time.time() - start_time
-    minutes = int(elapsed // 60)
-    seconds = int(elapsed % 60)
-    train_logger.info(f"[rank 0] validation completed in {minutes}m{seconds}s")
-    train_logger.info(f"== Validation :policy accuracy:【{policy_acc:.5f}】 value_mse: {value_mse:.5f}, margin_mse: {margin_mse:.5f}")
+    m, s = divmod(int(elapsed), 60)
+  
+    # ホスト同期して平均・精度算出
+    avg_policy_loss = (policy_sum / total_samples).item()
+    avg_value_mse   = (value_sum  / total_samples).item()
+    avg_margin_mse  = (margin_sum / total_samples).item()
+    policy_acc      = (correct.float() / total_samples).item()
+    total_loss = w_policy_loss * avg_policy_loss + w_value_loss * avg_value_mse + w_margin_loss * avg_margin_mse
+
+    # メトリクスログ（元のフォーマットを踏襲）
+    train_logger.info(f"[rank 0] validation completed in {m}m{s}s")
+    train_logger.info(
+        f"== Validation : total loss: {total_loss:.5f}  policy accuracy:【{policy_acc:.5f}】 value_mse: {avg_value_mse:.5f}, margin_mse: {avg_margin_mse:.5f}"
+    )
+
+    # Validation metrics をファイル出力
+    ts = datetime.datetime.now(JST).strftime("%Y-%m-%d %H:%M:%S")
+    # policy loss
+    with open(os.path.join(LOSS_LOG_DIR, "validation_policy_loss.log"), "a", encoding="utf-8") as f:
+        f.write(f"{ts},{avg_policy_loss:.5f}\n")
+    # value loss
+    with open(os.path.join(LOSS_LOG_DIR, "validation_value_loss.log"), "a", encoding="utf-8") as f:
+        f.write(f"{ts},{avg_value_mse:.5f}\n")
+    # policy accuracy
+    with open(os.path.join(LOSS_LOG_DIR, "validation_policy_acc.log"), "a", encoding="utf-8") as f:
+        f.write(f"{ts},{policy_acc:.5f}\n")
 
     model.train()
 
-    return policy_acc, value_mse, margin_mse
+    return policy_acc, avg_value_mse, avg_margin_mse, total_loss
 
 # ==============================
-# チェックポイント保存＆復元関数
+# チェックポイント保存関数
 # ==============================
-def save_checkpoint(model, optimizer, scheduler, epoch, best_val_loss, epochs_no_improve, best_policy_accuracy, checkpoint_file, device, batch_idx, base_seed):
+def save_checkpoint(model, optimizer, scheduler, best_total_loss, best_policy_accuracy, checkpoint_file):
+
+    train_logger.info(f"Checkpoint saved start to {checkpoint_file}")
+
     checkpoint = {
-        'epoch': epoch,
         'model_state_dict': model.state_dict(),
         'optimizer_state_dict': optimizer.state_dict(),
         'scheduler_state_dict': scheduler.state_dict(),  # スケジューラ状態の保存
-        'best_val_loss': best_val_loss,
-        'epochs_no_improve': epochs_no_improve,
-        'best_policy_accuracy': best_policy_accuracy,
-        'batch_idx': batch_idx,
-        'base_seed': base_seed
+        'best_total_loss': best_total_loss, # トータルロスベースのベスト保存
+        'best_policy_accuracy': best_policy_accuracy # 精度ベースのベスト保存
     }
     torch.save(checkpoint, checkpoint_file)
-    train_logger.info(f"Checkpoint saved at epoch {epoch} to {checkpoint_file}")
+
+    train_logger.info(f"Checkpoint saved end to {checkpoint_file}")
 
 # 訓練中のコンソール表示が崩れないように、ログ出力はしないバージョン
-def save_checkpoint_nolog(model, optimizer, scheduler, epoch, best_val_loss, epochs_no_improve, best_policy_accuracy, checkpoint_file, device,
-batch_idx, base_seed):
+def save_checkpoint_nolog(model, optimizer, scheduler, best_total_loss, best_policy_accuracy, checkpoint_file):
     """
-    訓練中のコンソール表示を行わない版チェックポイント保存。
+    訓練中のコンソール表示を行わない版チェックポイント保存
     """
     checkpoint = {
-        'epoch': epoch,
         'model_state_dict': model.state_dict(),
         'optimizer_state_dict': optimizer.state_dict(),
         'scheduler_state_dict': scheduler.state_dict(),
-        'best_val_loss': best_val_loss,
-        'epochs_no_improve': epochs_no_improve,
-        'best_policy_accuracy': best_policy_accuracy,
-        'batch_idx': batch_idx,
-        'base_seed': base_seed
+        'best_total_loss': best_total_loss,
+        'best_policy_accuracy': best_policy_accuracy
     }
     torch.save(checkpoint, checkpoint_file)
 
@@ -528,6 +686,9 @@ def recursive_to(data, device):
     else:
         return data
 
+# ==============================
+# チェックポイント復元関数
+# ==============================
 def load_checkpoint(model, optimizer, scheduler, checkpoint_file, device):
 
     if os.path.exists(checkpoint_file):
@@ -540,57 +701,17 @@ def load_checkpoint(model, optimizer, scheduler, checkpoint_file, device):
         # スケジューラ状態の復元を追加
         if scheduler is not None and 'scheduler_state_dict' in checkpoint:
             scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-        epoch = checkpoint.get('epoch', 0)
+               
+        # トータルロスベースのベストを読み込み（存在しなければ inf）
+        best_total_loss = checkpoint.get('best_total_loss', 10.0)
+
+        # 精度ベースのベストを読み込み（存在しなければ 0.0）
         best_policy_accuracy = checkpoint.get('best_policy_accuracy', 0.0)
-        batch_idx = checkpoint.get('batch_idx', -1)
-        base_seed  = checkpoint.get('base_seed', None)
-        return epoch, best_policy_accuracy, batch_idx, base_seed
+               
+        return  best_total_loss, best_policy_accuracy  
     else:
         train_logger.info("No checkpoint found. Starting from scratch.")
-        return 0, 0.0, -1, None
+        
+        return  10.0, 0.0
 
-# ==============================
-# Test用データセット生成（zip利用）
-# ==============================
-def prepare_test_dataset(sgf_dir, board_size, history_length, augment_all, output_file):
-    """
-    テスト用データセットを生成する関数
-    ・既にpickleファイルが存在する場合はそれをロードし、無ければSGFファイルからzipを作成してサンプル生成
-    ・生成したサンプルはpickle形式で保存する
-    """
-    if os.path.exists(output_file):
-        train_logger.info(f"Test dataset pickle {output_file} already exists. Loading it directly...")
-        return load_dataset(output_file)
-
-    if not os.path.exists(TEST_SGFS_ZIP):
-        train_logger.info(f"Creating zip archive {TEST_SGFS_ZIP} from SGF files in {sgf_dir} ...")
-        sgf_files = [os.path.join(sgf_dir, f) for f in os.listdir(sgf_dir)
-                     if f.endswith('.sgf') and "analyzed" not in f.lower()]
-        with zipfile.ZipFile(TEST_SGFS_ZIP, 'w') as zf:
-            for filepath in sgf_files:
-                zf.write(filepath, arcname=os.path.basename(filepath))
-        train_logger.info(f"Zip archive created: {TEST_SGFS_ZIP}")
-    else:
-        train_logger.info(f"Zip archive {TEST_SGFS_ZIP} already exists. Loading from it...")
-
-    all_samples = []
-
-    with zipfile.ZipFile(TEST_SGFS_ZIP, 'r') as zf:
-        # SGFファイルの名前リストを取得
-        sgf_names = [name for name in zf.namelist() if name.endswith('.sgf') and "analyzed" not in name.lower()]
-        sgf_names.sort()  # 名前順にソート
-        train_logger.info(f"TEST: Total SGF files in zip to process: {len(sgf_names)}")
-        for name in tqdm(sgf_names, desc="Processing TEST SGF files"):
-            try:
-                sgf_src = zf.read(name).decode('utf-8')
-                file_samples = process_sgf_to_samples_from_text(sgf_src, board_size, history_length, augment_all=False)
-                all_samples.extend(file_samples)
-            except Exception as e:
-                train_logger.error(f"Error processing {name} from zip: {e}")
-
-    # 生成されたサンプルをpickleファイルに保存
-    save_dataset(all_samples, output_file)
-    train_logger.info(f"TEST: Saved test dataset (total samples: {len(all_samples)}) to {output_file}")
-
-    return all_samples
 

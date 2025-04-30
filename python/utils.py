@@ -42,6 +42,11 @@ def load_config(config_path):
         factor = float(config.get("TRAIN", "factor", fallback="0.8"))
         # 一回のデータセット生成時に処理するファイル数
         number_max_files = int(config.get("TRAIN", "number_max_files", fallback="256"))
+        number_proc_files = int(config.get("TRAIN", "number_proc_files", fallback="64"))
+        val_interval = int(config.get("TRAIN", "val_interval", fallback="1"))
+        w_policy_loss = float(config.get("TRAIN", "w_policy_loss", fallback="1.0"))
+        w_value_loss = float(config.get("TRAIN", "w_value_loss", fallback="0.1"))
+        w_margin_loss = float(config.get("TRAIN", "w_margin_loss", fallback="0.0001"))
     except Exception as e:
         # 読み込みエラーが発生した場合はエラーログを出力し、プログラムを終了する
         train_logger.error(f"Error reading configuration: {e}")
@@ -60,7 +65,12 @@ def load_config(config_path):
         "learning_rate": learning_rate,
         "patience": patience,
         "factor": factor,
-        "number_max_files": number_max_files
+        "number_max_files": number_max_files,
+        "number_proc_files": number_proc_files,
+        "val_interval": val_interval,
+        "w_policy_loss": w_policy_loss,
+        "w_value_loss": w_value_loss,
+        "w_margin_loss": w_margin_loss
     }
 
 # 設定ファイルのパス（BASE_DIR配下にあると仮定）
@@ -81,5 +91,10 @@ learning_rate = config_params["learning_rate"]
 patience = config_params["patience"]
 factor = config_params["factor"]
 number_max_files = config_params["number_max_files"]
+number_proc_files = config_params["number_proc_files"]
+val_interval = config_params["val_interval"]
+w_policy_loss = config_params["w_policy_loss"]
+w_value_loss = config_params["w_value_loss"]
+w_margin_loss = config_params["w_margin_loss"]
 
 

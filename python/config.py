@@ -2,11 +2,12 @@
 # 必要なライブラリのインポート
 # ------------------------------
 import os
+import sys
 import argparse
 from tqdm import tqdm             # 進捗表示用ライブラリ（ループの状況を視覚的に表示）
-import torch.distributed as dist    # 分散学習に必要なモジュール
 import time                         # 時間計測・待機処理に利用
 from datetime import datetime, timedelta, timezone
+import logging
 
 ## コマンドライン引数で PREFIX を設定（config.py で利用）
 parser = argparse.ArgumentParser(add_help=False)
@@ -35,7 +36,7 @@ FORCE_RELOAD = force_reload_flag
 # ディレクトリ設定
 # ==============================
 # ディレクトリ設定（PREFIX は環境変数から取得）
-PREFIX = "ALL"
+PREFIX = "3"
 PREFIX = os.environ.get("PREFIX", PREFIX)
 
 if USE_COLAB:
@@ -57,10 +58,7 @@ else:
 # sgfファイル用進捗チェックポイントファイルのパス
 INFERENCE_MODEL_PREFIX = F"inference_{PREFIX}"
 CHECKPOINT_FILE_PREFIX = f"checkpoint_{PREFIX}" 
-PROGRESS_CHECKPOINT_FILE_PREFIX = f"progress_checkpoint_{PREFIX}"   
-
 CHECKPOINT_FILE = os.path.join(BASE_DIR, CHECKPOINT_FILE_PREFIX + ".pt")
-PROGRESS_CHECKPOINT_FILE = os.path.join(BASE_DIR, PROGRESS_CHECKPOINT_FILE_PREFIX + ".pkl")
 
 # モデル出力用のディレクトリが存在しない場合は自動で作成
 if not os.path.exists(MODEL_OUTPUT_DIR):
@@ -71,6 +69,7 @@ if not os.path.exists(MODEL_OUTPUT_DIR):
 # ==============================
 # tqdm の表示
 # ==============================
+tqdm_kwargs = dict(file=sys.stdout, leave=True)
 # カスタムフォーマッタを定義（常に hh:mm:ss 形式で出力）
 def fixed_format_interval(seconds):
     return time.strftime('%H:%M:%S', time.gmtime(seconds))
@@ -85,22 +84,29 @@ bar_fmt="{desc}:{percentage:3.0f}% {n:>4d}/{total:>4d} [{elapsed}<{remaining}, {
 # ==============================
 # FileLogger（シングルトン対応版）
 # ==============================
-# タイムゾーン設定（日本時間） -----
+# タイムゾーン設定（日本時間）
 JST = timezone(timedelta(hours=9), 'JST')
 
-# ログ出力ディレクトリ（Google Drive直下） -----
+# ログ出力ディレクトリ（Google Drive直下）
 LOG_DIR = "/content/drive/My Drive/sgf/logs"
 
-# タイムスタンプは実行ごとに固定化（環境変数に保存） -----
+# タイムスタンプは実行ごとに固定化（環境変数に保存）
 if "TRAIN_LOG_TIMESTAMP" not in os.environ:
     os.environ["TRAIN_LOG_TIMESTAMP"] = datetime.now(JST).strftime("%Y%m%d_%H%M%S")
 log_timestamp = os.environ["TRAIN_LOG_TIMESTAMP"]
 
-# ログファイルパスの決定（rank0 のみファイル出力、それ以外は捨てる） -----
+# ログファイルパスの決定（rank0 のみファイル出力、それ以外は捨てる）
 LOG_FILE_PATH = os.path.join(LOG_DIR, f"train_log_{log_timestamp}.log")
 
-# ログレベル（環境変数 LOG_LEVEL から制御。未指定なら INFO） -----
+# ログレベル（環境変数 LOG_LEVEL から制御。未指定なら INFO）
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO")  # 例: "DEBUG", "INFO", "WARNING", "ERROR"
+
+# lossログ用ディレクトリ
+LOSS_LOG_DIR = os.path.join(LOG_DIR, "loss_logs")
+os.makedirs(LOSS_LOG_DIR, exist_ok=True)
+
+# ファイル処理カウントの保存先
+COUNTS_FILE = os.path.join(LOG_DIR, "file_process_counts.pkl")
 
 # ==============================
 # FileLogger クラス定義
@@ -120,6 +126,7 @@ class FileLogger:
         timestamp = datetime.now(JST).strftime("%Y-%m-%d %H:%M:%S")
         log_line = f"{timestamp} {level}:{message}"
         print(log_line)  # コンソール出力（rank0以外も見える）
+        #tqdm.write(log_line)
         self.log_file.write(log_line + "\n")
         self.log_file.flush()
 
@@ -137,7 +144,6 @@ class FileLogger:
 # ==============================
 # シングルトンとして取得する関数
 # ==============================
-
 # グローバルに 1 インスタンスだけ保持
 _logger_instance = None
 
@@ -149,6 +155,33 @@ def get_logger():
     """
     global _logger_instance
     if _logger_instance is None:
-        _logger_instance = FileLogger()
-    return _logger_instance
+   #     _logger_instance = FileLogger()
+   # return _logger_instance
+        # Python 標準 logging.Logger を生成・設定
+        logger = logging.getLogger("")
+        # 既存のハンドラをクリアし、親ロガーへの伝播も無効化（重複出力防止）
+        logger.handlers.clear()
+        logger.propagate = False
 
+        # 環境変数から取得した LOG_LEVEL（文字列）を数値レベルに変換
+        level = getattr(logging, LOG_LEVEL, logging.INFO)
+        logger.setLevel(level)
+
+        # --- ファイルへの出力ハンドラ ---
+        fh = logging.FileHandler(LOG_FILE_PATH, encoding="utf-8")
+        fh.setLevel(level)
+        fmt = '%(asctime)s [%(levelname)s] %(message)s'
+        datefmt = '%Y-%m-%d %H:%M:%S'
+        formatter = logging.Formatter(fmt, datefmt=datefmt)
+        formatter.converter = lambda ts: datetime.fromtimestamp(ts, JST).timetuple()
+        fh.setFormatter(formatter)
+        logger.addHandler(fh)
+
+        # --- コンソール出力用ハンドラ（tqdm.write をやめて通常の StreamHandler を使う） ---
+        sh = logging.StreamHandler(stream=sys.stdout)
+        sh.setLevel(level)
+        sh.setFormatter(formatter)
+        logger.addHandler(sh)
+        _logger_instance = logger
+
+    return _logger_instance
