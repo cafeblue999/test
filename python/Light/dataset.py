@@ -406,6 +406,60 @@ def save_best_acc_model(model, policy_accuracy, device):
                         train_logger.warning(f"Failed to delete {fname}: {e}")
 
 # ==============================
+# 最良モデル保存用関数(total loss)
+# ==============================
+def save_best_loss_model(model, total_loss, device):
+    """
+    現在の policy_accuracy が最高値を更新したら：
+      1) state_dict モデルを保存
+      2) 推論モデルを保存
+      3) 古いスコア付きファイルを一掃
+      4) 最新の最高値を返す
+    """
+    # ── 1) 新規ファイルパスを定義 ──
+    new_model_file     = os.path.join(
+        MODEL_OUTPUT_DIR, f"model_{PREFIX}_loss_{total_loss:.5f}.pt"
+    )
+    new_inference_file = os.path.join(
+        MODEL_OUTPUT_DIR, f"{INFERENCE_MODEL_PREFIX}_loss_{total_loss:.5f}.pt"
+    )
+
+    # ── 2) モデル保存 ──
+    torch.save(model.state_dict(), new_model_file)
+    train_logger.info(f"● New best loss model saved: {new_model_file}")
+
+    save_inference_model(model, device, os.path.basename(new_inference_file))
+
+    # ── 3) 古いスコア付きファイルを一掃 ──
+    pattern = re.compile(r'^(?P<prefix>.+_)(?P<score>\d+\.\d+)\.pt$')
+
+    groups = {}
+    for fname in os.listdir(MODEL_OUTPUT_DIR):
+        m = pattern.match(fname)
+        if not m:
+            continue
+        prefix = m.group('prefix')        # ex. "model_ALL_" or "inference_ALL_"
+        score  = float(m.group('score'))  # ex. 0.34118
+        groups.setdefault(prefix, []).append((fname, score))
+
+    for prefix, flist in groups.items():
+        # 各プレフィックスで最大スコアを計算
+        max_score = max(score for _, score in flist)
+        for fname, score in flist:
+            if score < max_score:
+                path = os.path.join(MODEL_OUTPUT_DIR, fname)
+                # 新たに保存した model/inference ファイルだけは残す
+                if path not in (new_model_file, new_inference_file):
+                    try:
+                        os.remove(path)
+                        train_logger.info(f"Deleted old file: {fname}")
+                    except OSError as e:
+                        train_logger.warning(f"Failed to delete {fname}: {e}")
+
+# ==============================
+# モデル検証関数（修正版）
+# ==============================
+# ==============================
 # モデル検証関数（mse_criterion 廃止版）
 # ==============================
 def validate_model(model, test_loader, device):

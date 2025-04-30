@@ -24,7 +24,7 @@ from dataset import (
     save_checkpoint_nolog,
     validate_model,
     save_best_acc_model,
-    #save_best_loss_model,
+    save_best_loss_model,
     save_inference_model,
     process_sgf_to_samples_from_text,
     load_checkpoint
@@ -273,9 +273,9 @@ def _mp_fn(rank):
             if total_loss < best_total_loss:
                 train_logger.info(f"[rank {rank}] _mp_fn: total_loss {best_total_loss:.5f} → {total_loss:.5f}" )
                 best_total_loss = total_loss
-            #    save_best_loss_model(model, total_loss, device)
-            #else:
-            #    save_inference_model(model, device, f"{INFERENCE_MODEL_PREFIX}_loss_tmp.pt")
+                save_best_loss_model(model, total_loss, device)
+            else:
+                save_inference_model(model, device, f"{INFERENCE_MODEL_PREFIX}_loss_tmp.pt")
 
             if policy_acc > best_policy_accuracy:
                 save_best_acc_model(model, policy_acc, device)
