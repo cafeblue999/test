@@ -1,7 +1,7 @@
-## コード処理内容及び仕様書（詳細版）
+## コード処理内容及び仕様書（詳細・関数別解説付き）
 
-本書は、以下5つのファイル (`config.py`, `utils.py`, `model.py`, `dataset.py`, `train.py`) からなるプロジェクトの処理内容および仕様を、**処理順**に従いかつ**設計意図付き**で詳細に記述したドキュメントである。
-印刷配布可能な形式としてMarkdownベースで構成している。
+本書は、以下 5 つのファイル (`config.py`, `utils.py`, `model.py`, `dataset.py`, `train.py`) からなるプロジェクトの処理内容および仕様を、**処理順・関数単位**で詳細に記述したドキュメントである。
+印刷配布可能な形式として Markdown ベースで構成している。
 
 ---
 
@@ -16,125 +16,161 @@
 ---
 
 <a name="configpy"></a>
+
 ## 1. config.py
 
-### 1.1 概要と設計意図
-- **目的**：SGFデータ処理および学習パラメータに関する設定を、簡潔かつ一元的に管理する。
-- **CLI引数対応により、実験バリエーション（接頭辞や再読み込み）に柔軟に対応可能。**
+### 関数：`get_logger(name: str, level=logging.INFO)`
 
-### 1.2 詳細処理
-1. `argparse` を使って以下を読み取る：
-   - `--prefix`：SGFデータセットの識別用接頭辞（例：3 → train_sgf_3）
-   - `--force_reload`：pickle化済みデータセットを再構築するかどうか
-2. `datetime.timezone(datetime.timedelta(hours=+9), 'JST')` による日本時間固定。ロギングとファイル命名の一貫性のため。
-3. `get_logger()` 関数：ファイル＆コンソール両対応のロガーを統一形式で生成。視認性とデバッグ効率の向上を意図。
-4. 複数のグローバル定数を定義：
-   - SGFディレクトリ（TRAIN_SGF_DIR 等）
-   - モデル保存ディレクトリ（MODEL_OUTPUT_DIR）
-   - チェックポイントファイルの命名（CHECKPOINT_FILE）
+- **目的**：ファイルおよびコンソールにログを出力するロガーを構築
+- **処理内容**：
+  1. `logging.getLogger(name)` によりロガーインスタンス取得
+  2. ログレベルを設定（デフォルト：INFO）
+  3. `StreamHandler`（コンソール）と `FileHandler`（log/train.log）を追加
+  4. フォーマット：時間付き `[INFO] メッセージ` 形式
 
 ---
 
 <a name="utilspy"></a>
+
 ## 2. utils.py
 
-### 2.1 概要と設計意図
-- **目的**：定数定義と各所から再利用される関数を一元化。設定ミス防止、可読性向上。
+### 定数群
 
-### 2.2 処理内容
-- `BOARD_SIZE=19`, `HISTORY_LENGTH=8`, `NUM_CHANNELS=17` などは、囲碁の盤面処理における入力特徴量定義。
-- `model_channels`, `num_residual_blocks`：ResNetの幅・深さを制御。チューニング可能。
-- `bar_fmt`：プログレスバーの形式を明示的に統一。Colabなどで崩れないよう配慮。
+- `BOARD_SIZE`：囲碁盤のサイズ（19）
+- `HISTORY_LENGTH`：履歴の深さ（過去 8 手）
+- `NUM_CHANNELS`：学習モデル入力チャネル数（17）
+- `model_channels`, `num_residual_blocks`：ResNet 設定
+- `batch_size`, `learning_rate`, `patience`, `factor`, `number_max_files`：学習パラメータ
+- `bar_fmt`：tqdm のプログレスバー用書式文字列
 
 ---
 
 <a name="modelpy"></a>
+
 ## 3. model.py
 
-### 3.1 概要と設計意図
-- **目的**：AlphaZero型Policy-Valueネットワークの実装
-- ResNet構造により、囲碁における局所特徴・大局的判断を両立させる
+### クラス：`EnhancedResNetPolicyValueNetwork`
 
-### 3.2 処理構造
-1. `EnhancedResNetPolicyValueNetwork` クラスを定義。PyTorch nn.Module を継承。
-2. `__init__()` にて以下を構築：
-   - 初期畳み込み（Conv2D）とBatchNormで特徴抽出
-   - 残差ブロックをfor文で構築（深さパラメータ指定）
-   - ポリシーヘッド：出力空間は19x19（盤面）+1（パス）
-   - バリューヘッド：最終的にtanhにより [-1, 1] の勝率スカラーへ
-3. `forward()` にて：
-   - 特徴マップ → 各ブロック通過 → 並列に2ヘッドに分岐
+- **目的**：囲碁の盤面を入力とし、着手確率（policy）と勝率（value）を出力する。
 
-### 3.3 理由
-- ポリシーは確率分布なのでlogits→softmax
-- バリューは勝率スカラーなのでtanh（学習安定のため）
-- 残差構造は学習深度を確保しつつ勾配消失を抑制
+#### `__init__()`
+
+- **引数**：`board_size`, `channels`, `num_blocks`, `input_channels`
+- **処理内容**：
+  - 初期 Conv + BatchNorm
+  - `num_blocks`回の ResBlock（`self.res_blocks`）
+  - `policy_head`（盤面全体＋パス用 Softmax）
+  - `value_head`（出力 1 つ、tanh）
+
+#### `forward(x)`
+
+- **引数**：Tensor (B, C, 19, 19)
+- **出力**：
+  - `policy`: Tensor (B, 362)
+  - `value`: Tensor (B, 1)
+  - `margin`: Tensor (B, 1)
+- **内部処理**：ResNet 構造で特徴抽出 → ヘッド分岐して出力計算
 
 ---
 
 <a name="datasetpy"></a>
+
 ## 4. dataset.py
 
-### 4.1 概要と設計意図
-- **目的**：SGF形式の囲碁棋譜をAlphaZeroトレーニング用データに変換。
-- zip対応、データ前処理、死活除去、特徴展開をすべてこのモジュール内で完結。
+### クラス：`AlphaZeroSGFDatasetPreloaded`
 
-### 4.2 主な構成
-#### 1. `AlphaZeroSGFDatasetPreloaded`
-- zip内SGFも含め、SGF全体を読み取り、パース後にメモリ展開
-- `__len__`, `__getitem__` を実装し、DataLoaderから使える
-- 特徴量は 8履歴 + 現局面 + 着手権 + 石の存在などを17チャネルで構成
+- **目的**：事前に SGF ファイルをすべて読み込み、学習用サンプルに変換する Dataset クラス
 
-#### 2. `prepare_test_dataset`
-- 検証用のSGFデータを同様に一括パースし、固定的に返す
-- epoch間でバリデーションデータを再利用する構造
+#### `__init__(self, samples)`
 
-#### 3. `process_sgf_to_samples_from_text`
-- SGF文字列を直接渡して処理（テスト・Colab向け）
-- SGFパーサは内部関数で整備済み
+- `samples`：局面データ（特徴・policy・value・margin）
+- 全体をリストとして保持
 
-#### 4. zip対応とキャッシュ
-- `train_KK_XXXX.zip` などのzipアーカイブを直接読み込み展開
-- pickle形式に変換してキャッシュ高速化（再実行時）
+#### `__len__()`
 
-### 4.3 設計意図
-- 巨大なSGFデータでも分散ローディング＆メモリ高速展開で学習高速化
-- zip対応：Google Drive などでSGFを圧縮管理する前提設計
+- 保持するサンプル数を返す
+
+#### `__getitem__(idx)`
+
+- 指定されたサンプルインデックスの局面を返す
+- `board`, `target_policy`, `target_value`, `target_margin`
+
+---
+
+### 関数：`prepare_test_dataset()`
+
+- SGF バリデーションデータを読み込み、テスト用に整形して返す
+
+### 関数：`load_progress_checkpoint()`／`save_progress_checkpoint()`
+
+- pickle ファイルによる進捗保存・復元
+
+### 関数：`process_sgf_to_samples_from_text(text)`
+
+- SGF ファイルの文字列を直接パースして、訓練サンプル化
 
 ---
 
 <a name="trainpy"></a>
+
 ## 5. train.py
 
-### 5.1 概要と設計意図
-- **目的**：TPU/xmp環境下での高速分散学習を自動制御
-- 複数rankに同じSGFファイルが重複せずに割り当てられるよう制御
-- checkpoint/バリデーション/モデル保存/シード制御すべてを統括
+### 関数：`validate_model(model, test_loader, device)`
 
-### 5.2 初期処理
-1. 各種定数＆ロガー取得（`train_logger = get_logger()`）
-2. TPU使用環境下では `xmp.spawn(_mp_fn)` によって8プロセス起動
+- **目的**：検証データに対する policy accuracy, value loss, margin loss を計算
+- **処理内容**：
+  1. `model.eval()` 設定
+  2. 各バッチで `forward` 実行し、出力取得：`policy, value, margin`
+  3. クロスエントロピー：`F.cross_entropy(policy_pred, target_policy)`
+  4. MSE：`F.mse_loss(value_pred, target_value)`, `F.mse_loss(margin_pred, target_margin)`
+  5. Accuracy 計算：`argmax`を比較して正解率を累積
+  6. Tensor で同期して平均を返す（TPU 並列考慮）
 
-### 5.3 `_mp_fn(rank)` 処理内容（メイン学習処理）
-1. TPUプロセス情報取得：`ordinal`, `device`, `world_size`
-2. SGF zipファイル一覧列挙 → `number_max_files` 単位でサンプリング
-3. 学習epochループ（`while True`）開始：
-   - シード設定（epoch+rankによるユニークシード）
-   - モデル・オプティマイザ・ReduceLROnPlateau を初期化
-   - `DistributedSampler` → `DataLoader` → `MpDeviceLoader` で分散学習ローダ構築
-   - forループで各バッチを処理：
-     - `forward()` → 損失（policy, value, margin）を加重和で合成
-     - `backward()` → `step()` → 損失をロガーとファイルへ記録
-     - `local_loop_cnt` ごとにチェックポイント＆ベストモデル保存
-     - `validate_model()` により rank 0 だけ検証実施
+### 関数：`save_checkpoint(model, optimizer, scheduler, epoch, best_policy_accuracy, best_total_loss)`
 
-### 5.4 設計意図
-- **rankごとに異なるデータサンプリング**：処理の重複を避け効率化
-- **policy accuracy と total loss の両軸でベストモデル保存**：実務での汎化性能と整合
-- **無限ループで自動学習**：Google Colab の割り当て時間で自動継続させる意図
-- **CSVログ出力**：Google Sheet やグラフ描画を想定したフォーマット
+- モデル構造・重み、オプティマイザ状態、スケジューラ、スコアを辞書に保存
+- `torch.save()` で `checkpoint_X.pt` として出力
+
+### 関数：`load_checkpoint(...)`
+
+- 上記チェックポイントを読み込み、model/load_state_dict、optimizer.load_state_dict 等を適用
+
+### 関数：`save_best_model(model, policy_accuracy, device)`
+
+- 現在の policy accuracy が過去最高であれば、
+  - `model_{prefix}_acc_{score}.pt` として保存
+  - `save_inference_model()` により軽量モデルも保存
+
+### 関数：`save_inference_model(model, device, output_file)`
+
+- `model.to(device)` で配置後、`torch.jit.trace(model, dummy_input)` → `save()` で保存
+
+### 関数：`_mp_fn(rank)`
+
+- TPU/XLA 分散学習の各プロセスが実行する本体関数
+
+#### 処理概要：
+
+1. SGF zip ファイル読み込み → ランダムに分割サンプリング
+2. `DistributedSampler` → `DataLoader` 構築（rank ごとに異なるサンプル）
+3. **損失計算の詳細**：
+
+```python
+policy_loss = F.cross_entropy(policy_preds, target_policies)
+value_loss  = F.mse_loss(value_preds.squeeze(1), target_values)
+margin_loss = F.mse_loss(margin_preds.squeeze(1), target_margins)
+```
+
+4. **合計損失**：重み付き和
+
+```python
+total_loss = w_policy_loss * policy_loss + w_value_loss * value_loss + w_margin_loss * margin_loss
+```
+
+5. `total_loss.backward()` → `optimizer.step()` で更新
+6. validation タイミングで `validate_model()` を実行
+7. `best_policy_accuracy` や `best_total_loss` を更新判定して保存
 
 ---
 
-以上。各ファイル間は明確な責任分離を意識しており、実験管理・学習再現性・分散効率に配慮された設計となっている。
-
+以上が関数単位での処理内容および設計理由、損失計算など関数内部ロジックまで含めた詳細な仕様解説である。さらに必要であれば、コード抜粋や図式化なども可能。
