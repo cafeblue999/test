@@ -57,7 +57,12 @@ def weighted_file_sample(all_files, counts_file, number_max_files):
 
     # 全ファイルIDリストと重みリストを生成
     file_ids = [f"{zp}:{ename}" for zp, ename in all_files]
-    weights = [1.0 / (counts.get(fid, 0) + 1) for fid in file_ids]
+    # べき乗で「浅いカウント」をさらに強調
+    exponent = 2.0  # 1.0 なら元の逆数、2.0 にすると 1/(count+1)^2 の重み
+    weights = [
+        1.0 / ((counts.get(fid, 0) + 1) ** exponent)
+        for fid in file_ids
+    ]
 
     # 正規化して確率分布に
     total_w = float(sum(weights))
@@ -240,18 +245,22 @@ def _mp_fn(rank):
           
         if rank == 0:
             current_lr = optimizer.param_groups[0]["lr"]
+            mode = scheduler.state_dict()['mode']
+            bad_epochs = scheduler.num_bad_epochs
             train_logger.info(f"[rank {rank}] =========== params ============")
             train_logger.info(f"[rank {rank}] epoch: {local_loop_cnt}")
-            train_logger.info(f"[rank {rank}] learning_rate (from optimizer): {current_lr:.8f}")
-            train_logger.info(f"[rank {rank}] patience: {patience}")
-            train_logger.info(f"[rank {rank}] factor: {factor}")
-            train_logger.info(f"[rank {rank}] number_max_files: {number_max_files}")
-            train_logger.info(f"[rank {rank}] best_total_loss (from checkpoint): {best_total_loss:.5f}")
+            train_logger.info(f"[rank {rank}] optimizer lr_rate    (from optimizer): {current_lr:.8f}")
+            train_logger.info(f"[rank {rank}] scheduler patience:  {patience}")
+            train_logger.info(f"[rank {rank}] scheduler factor:    {factor}")
+            train_logger.info(f"[rank {rank}] scheduler mode       (from checkpoint): {mode}")
+            train_logger.info(f"[rank {rank}] scheduler bad_epochs (from checkpoint): {bad_epochs}")
+            train_logger.info(f"[rank {rank}] best_total_loss      (from checkpoint): {best_total_loss:.5f}")
             train_logger.info(f"[rank {rank}] best_policy_accuracy (from checkpoint): {best_policy_accuracy:.5f}")
-            train_logger.info(f"[rank {rank}] val_interval: {val_interval}")
-            train_logger.info(f"[rank {rank}] w_policy_loss: {w_policy_loss}")
-            train_logger.info(f"[rank {rank}] w_value_loss:  {w_value_loss}")
-            train_logger.info(f"[rank {rank}] w_value_loss:  {w_margin_loss}")
+            train_logger.info(f"[rank {rank}] number_max_files: {number_max_files}")
+            train_logger.info(f"[rank {rank}] val_interval:     {val_interval}")
+            train_logger.info(f"[rank {rank}] w_policy_loss:    {w_policy_loss}")
+            train_logger.info(f"[rank {rank}] w_value_loss:     {w_value_loss}")
+            train_logger.info(f"[rank {rank}] w_value_loss:     {w_margin_loss}")
             train_logger.info(f"[rank {rank}] ===============================")
         
         # ① 全rank共通でnumber_max_filesファイルを全SGFファイルより選択
@@ -337,6 +346,7 @@ def _mp_fn(rank):
 
             # 学習率調整
             scheduler.step(policy_acc)
+            #scheduler.step(total_loss)
 
             # scheduler.step() 実行後の学習率を表示
             after_lr = optimizer.param_groups[0]["lr"]
@@ -380,7 +390,7 @@ def main():
     train_logger.info(f"val_interval: {val_interval}")
     train_logger.info(f"w_policy_loss: {w_policy_loss}")
     train_logger.info(f"w_value_loss:  {w_value_loss}")
-    train_logger.info(f"w_value_loss:  {w_margin_loss}")
+    train_logger.info(f"w_margin_loss:  {w_margin_loss}")
     train_logger.info(f"===============================")
 
     # ここに各種初期化、設定ロード、ロガー設定など
