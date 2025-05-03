@@ -1,156 +1,139 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from utils import NUM_ACTIONS
-# ==============================
-# ネットワーク定義
-# ==============================
-# ResidualBlock : 標準的な残差ブロック（スキップ接続を含む）
+
+
+class SEBlock(nn.Module):
+    """
+    チャネル方向の重みづけを学習する Squeeze-and-Excitation ブロック。
+    各チャネルの重要度を自己学習し、特徴マップを強調・抑制する。
+    """
+    def __init__(self, channels, reduction=16):
+        super().__init__()
+        self.pool = nn.AdaptiveAvgPool2d(1)
+        self.fc = nn.Sequential(
+            nn.Linear(channels, channels // reduction, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Linear(channels // reduction, channels, bias=False),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        b, c, _, _ = x.size()
+        y = self.pool(x).view(b, c)
+        y = self.fc(y).view(b, c, 1, 1)
+        return x * y.expand_as(x)
+
+
 class ResidualBlock(nn.Module):
+    """
+    通常の ResNet 構造に SEBlock を付加した ResidualBlock。
+    """
     def __init__(self, channels):
-        """
-        パラメータ:
-          channels (int): 入力および出力のチャネル数
-        """
-        super(ResidualBlock, self).__init__()
-        # カーネルサイズ3、パディング1の畳み込み層を2層定義
-        self.conv1 = nn.Conv2d(channels, channels, kernel_size=3, padding=1)
-        self.bn1 = nn.BatchNorm2d(channels)  # 畳み込み後のバッチ正規化層
-        self.conv2 = nn.Conv2d(channels, channels, kernel_size=3, padding=1)
-        self.bn2 = nn.BatchNorm2d(channels)
-    def forward(self, x):
-        # 入力を残差として保持（スキップ接続）
-        residual = x
-        # 1回目の畳み込み→正規化→ReLU
-        out = F.relu(self.bn1(self.conv1(x)))
-        # 2回目の畳み込み→正規化
-        out = self.bn2(self.conv2(out))
-        # スキップ接続により、入力と出力を加算
-        out += residual
-        # 最終的にReLUを適用して出力
-        return F.relu(out)
-
-# DilatedResidualBlock : 拡張（dilated）畳み込みを用いた残差ブロック
-class DilatedResidualBlock(nn.Module):
-    def __init__(self, channels, dilation=2):
-        """
-        パラメータ:
-          channels (int): 入力および出力チャネル数
-          dilation (int): 拡張率（dilation rate）
-        """
-        super(DilatedResidualBlock, self).__init__()
-        # 拡張畳み込み（dilation指定、パディングにdilationの値を利用）
-        self.conv1 = nn.Conv2d(channels, channels, kernel_size=3, padding=dilation, dilation=dilation)
+        super().__init__()
+        self.conv1 = nn.Conv2d(channels, channels, kernel_size=3, padding=1, bias=False)
         self.bn1 = nn.BatchNorm2d(channels)
-        # 通常の畳み込み層
-        self.conv2 = nn.Conv2d(channels, channels, kernel_size=3, padding=1)
+        self.conv2 = nn.Conv2d(channels, channels, kernel_size=3, padding=1, bias=False)
         self.bn2 = nn.BatchNorm2d(channels)
-    def forward(self, x):
-        residual = x  # 入力をスキップ接続用に保持
-        out = F.relu(self.bn1(self.conv1(x)))  # 拡張畳み込み＋正規化＋ReLU
-        out = self.bn2(self.conv2(out))         # 通常の畳み込み＋正規化
-        out += residual                         # スキップ接続：入力を加算
-        return F.relu(out)                      # 最後にReLUを適用して出力
+        self.se = SEBlock(channels)
 
-# SelfAttention : セルフアテンション機構の層。空間的な自己相関を計算する
-class SelfAttention(nn.Module):
-    def __init__(self, in_channels):
-        """
-        パラメータ:
-          in_channels (int): 入力チャネル数
-        """
-        super(SelfAttention, self).__init__()
-        # クエリを得るための1x1畳み込み。チャネル数を1/8に縮小
-        self.query_conv = nn.Conv2d(in_channels, in_channels // 8, kernel_size=1)
-        # キーを得るための1x1畳み込み（同じくチャネルを1/8に）
-        self.key_conv = nn.Conv2d(in_channels, in_channels // 8, kernel_size=1)
-        # バリューを得るための1x1畳み込み（チャネル数は変えない）
-        self.value_conv = nn.Conv2d(in_channels, in_channels, kernel_size=1)
-        # 出力へのスケールパラメータ（学習可能なパラメータとして0で初期化）
-        self.gamma = nn.Parameter(torch.zeros(1))
-        # ソフトマックス関数でアテンション係数を正規化（最後の次元で適用）
-        self.softmax = nn.Softmax(dim=-1)
     def forward(self, x):
-        batch, C, H, W = x.size()  # 入力の形状を取得
-        # クエリを計算し、形状を (batch, H*W, C//8) に変形
-        proj_query = self.query_conv(x).view(batch, -1, H * W).permute(0, 2, 1)
-        # キーを計算し、形状を (batch, C//8, H*W) に変形
-        proj_key = self.key_conv(x).view(batch, -1, H * W)
-        # クエリとキーのバッチ積により相関（エネルギー）を計算
-        energy = torch.bmm(proj_query, proj_key)
-        # ソフトマックスにより、各位置での注意重みを計算
-        attention = self.softmax(energy)
-        # バリューを計算し、形状を (batch, C, H*W) に変形
-        proj_value = self.value_conv(x).view(batch, -1, H * W)
-        # バッチ積により、注目情報を反映した出力を計算（注意の転置を使用）
-        out = torch.bmm(proj_value, attention.permute(0, 2, 1))
-        out = out.view(batch, C, H, W)  # 元の空間サイズに戻す
-        # スケールパラメータを掛けた出力を元入力に足し込み、最終出力とする
+        residual = x
+        out = F.relu(self.bn1(self.conv1(x)))
+        out = self.bn2(self.conv2(out))
+        out = self.se(out)
+        return F.relu(out + residual)
+
+
+class MultiHeadSelfAttention(nn.Module):
+    """
+    相対位置エンコーディング付きの Multi-Head Self Attention。
+    盤面上の位置に応じて注意を変化させることができる。
+    """
+    def __init__(self, in_channels, heads=4):
+        super().__init__()
+        assert in_channels % heads == 0
+        self.heads = heads
+        self.key = nn.Conv2d(in_channels, in_channels, 1, bias=False)
+        self.query = nn.Conv2d(in_channels, in_channels, 1, bias=False)
+        self.value = nn.Conv2d(in_channels, in_channels, 1, bias=False)
+        self.scale = (in_channels // heads) ** -0.5
+        self.gamma = nn.Parameter(torch.zeros(1))
+        self.rel_pos_h = nn.Parameter(torch.randn((1, in_channels // heads, 1, 19)), requires_grad=True)
+        self.rel_pos_w = nn.Parameter(torch.randn((1, in_channels // heads, 19, 1)), requires_grad=True)
+
+    def forward(self, x):
+        B, C, H, W = x.shape
+        k = self.key(x).reshape(B, self.heads, C // self.heads, H * W)
+        q = self.query(x).reshape(B, self.heads, C // self.heads, H * W)
+        v = self.value(x).reshape(B, self.heads, C // self.heads, H * W)
+
+        attn = torch.matmul(q.transpose(-2, -1), k) * self.scale  # (B, heads, HW, HW)
+        attn = F.softmax(attn, dim=-1)
+        out = torch.matmul(attn, v.transpose(-2, -1))
+        out = out.transpose(-2, -1).contiguous().view(B, C, H, W)
+
+        # 相対位置エンコーディングを各ヘッドごとに繰り返し、チャンネル数 C に揃える
+        # rel_pos_h: (1, C//heads,1, W) → (1, C,1, W)
+        rel_h = self.rel_pos_h.repeat(1, self.heads, 1, 1)
+        rel_w = self.rel_pos_w.repeat(1, self.heads, 1, 1)
+        # ブロードキャストして加算
+        out = out + rel_h.expand(B, -1, H, W) + rel_w.expand(B, -1, H, W)
         return self.gamma * out + x
 
-# EnhancedResNetPolicyValueNetwork : 改良版残差ネットワークに基づく、ポリシーとバリューを同時に出力するネットワーク
-class EnhancedResNetPolicyValueNetwork(nn.Module):
-    def __init__(self, board_size, num_channels, num_residual_blocks, in_channels):
-        """
-        パラメータ:
-          board_size (int): 盤面のサイズ（例：19）
-          num_channels (int): 入力特徴マップのチャネル数
-          num_residual_blocks (int): 残差ブロックの数
-          in_channels (int): ネットワークへの入力チャネル数
-        """
-        super(EnhancedResNetPolicyValueNetwork, self).__init__()
-        self.board_size = board_size
-        # 入力層：3x3畳み込みとバッチ正規化を適用して特徴抽出
-        self.conv_input = nn.Conv2d(in_channels, num_channels, kernel_size=3, padding=1)
-        self.bn_input = nn.BatchNorm2d(num_channels)
-        # 残差ブロックをリストに格納。一定ごとに拡張畳み込みブロックを使用
-        blocks = []
-        for i in range(num_residual_blocks):
-            if i % 4 == 0:
-                blocks.append(DilatedResidualBlock(num_channels, dilation=2))
-            else:
-                blocks.append(ResidualBlock(num_channels))
-        # リストのブロックを連結してシーケンシャルなモデルにする
-        self.residual_blocks = nn.Sequential(*blocks)
-        # セルフアテンション層を配置（特徴マップ内の依存関係を補正）
-        self.attention = SelfAttention(num_channels)
-        # ----- ポリシーヘッドの構築 -----
-        # 1x1畳み込みとバッチ正規化でチャネル数を2に縮小
-        self.conv_policy = nn.Conv2d(num_channels, 2, kernel_size=1)
-        self.bn_policy = nn.BatchNorm2d(2)
-        self.dropout_policy = nn.Dropout(p=0.5)  # 過学習防止のためDropoutを適用
-        # 全結合層：2チャネルの各位置をフラット化し、全ての行動（盤面のマス＋パス）を出力
-        self.fc_policy = nn.Linear(2 * board_size * board_size, NUM_ACTIONS)
-        # ----- バリューヘッドの構築 -----
-        # 1x1畳み込みとバッチ正規化で1チャネルに縮小し、盤面全体の特徴を抽出
-        self.conv_value = nn.Conv2d(num_channels, 1, kernel_size=1)
-        self.bn_value = nn.BatchNorm2d(1)
-        # 隠れ層全結合：盤面情報を64次元へ変換
-        self.fc_value1 = nn.Linear(board_size * board_size, 64)
-        self.dropout_value = nn.Dropout(p=0.5)
-        # 最終出力は2ユニット。1つはvalue（勝ち負けの評価）、もう1つはmargin（差分情報）として出力
-        self.fc_value2 = nn.Linear(64, 2)
-    def forward(self, x):
-        # 入力層処理：畳み込み→正規化→ReLU
-        x = F.relu(self.bn_input(self.conv_input(x)))
-        # 複数の残差ブロック（および拡張畳み込みブロック）の適用
-        x = self.residual_blocks(x)
-        # セルフアテンション層を適用して特徴マップを補正
-        x = self.attention(x)
-        # ---- ポリシーヘッド処理 ----
-        p = F.relu(self.bn_policy(self.conv_policy(x)))
-        p = self.dropout_policy(p)
-        p = p.view(p.size(0), -1)  # フラット化して全結合層への入力形状に
-        p = self.fc_policy(p)
-        p = F.log_softmax(p, dim=1)  # 出力の対数確率に変換
-        # ---- バリューヘッド処理 ----
-        v = F.relu(self.bn_value(self.conv_value(x)))
-        v = v.view(v.size(0), -1)
-        v = F.relu(self.fc_value1(v))
-        v = self.dropout_value(v)
-        out = self.fc_value2(v)
-        # 1ユニット目を [tanh] で正規化し[-1,1]の範囲に収め、残りをmarginとしてそのまま出力
-        value = torch.tanh(out[:, 0])
-        margin = out[:, 1]
-        return p, (value, margin)
 
+class EnhancedResNetPolicyValueNetwork(nn.Module):
+    """
+    改良版 ResNet ベースの囲碁ポリシー・バリューネットワーク。
+    - SEBlock を各 ResidualBlock に統合
+    - SelfAttention を後半に分散挿入
+    - margin 出力なし（policy, value のみ）
+    """
+    def __init__(self, board_size=19, in_channels=17, num_channels=256, num_blocks=40):
+        super().__init__()
+        self.board_size = board_size
+        self.num_actions = board_size * board_size + 1  # +1 for pass
+
+        # 入力層
+        self.conv_in = nn.Sequential(
+            nn.Conv2d(in_channels, num_channels, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(num_channels),
+            nn.ReLU(inplace=True)
+        )
+
+        # Residual blocks + SelfAttention（後半に集中）
+        blocks = []
+        for i in range(num_blocks):
+            blocks.append(ResidualBlock(num_channels))
+            if i >= 30 and (i % 2 == 0):
+                blocks.append(MultiHeadSelfAttention(num_channels, heads=4))
+        self.residual_blocks = nn.Sequential(*blocks)
+
+        # Policy Head（打ち手の分布予測）
+        self.policy_head = nn.Sequential(
+            nn.Conv2d(num_channels, 2, kernel_size=1, bias=False),
+            nn.BatchNorm2d(2),
+            nn.ReLU(inplace=True),
+            nn.Dropout(p=0.3),
+            nn.Flatten(),
+            nn.Linear(2 * board_size * board_size, self.num_actions)
+        )
+
+        # Value Head（勝率予測）
+        self.value_head = nn.Sequential(
+            nn.Conv2d(num_channels, 1, kernel_size=1, bias=False),
+            nn.BatchNorm2d(1),
+            nn.ReLU(inplace=True),
+            nn.Flatten(),
+            nn.Linear(board_size * board_size, 256),
+            nn.ReLU(inplace=True),
+            nn.Linear(256, 1),
+            nn.Tanh()  # 出力を [-1, 1] 範囲に制限
+        )
+
+    def forward(self, x):
+        x = self.conv_in(x)
+        x = self.residual_blocks(x)
+        policy = self.policy_head(x)
+        value = self.value_head(x)
+        return policy, value

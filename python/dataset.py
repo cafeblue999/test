@@ -13,7 +13,7 @@ from torch_xla.distributed.parallel_loader import MpDeviceLoader
 from torch.utils.data import Dataset
 from tqdm import tqdm
 from config import USE_TPU, get_logger, PREFIX, MODEL_OUTPUT_DIR, INFERENCE_MODEL_PREFIX, bar_fmt, TEST_SGFS_ZIP, tqdm_kwargs, LOSS_LOG_DIR, JST, COUNTS_FILE
-from utils  import BOARD_SIZE, NUM_CHANNELS, w_policy_loss, w_value_loss, w_margin_loss
+from utils  import BOARD_SIZE, NUM_CHANNELS, w_policy_loss, w_value_loss
 
 train_logger = get_logger()
 
@@ -74,8 +74,8 @@ def build_input_from_history(history, current_player, board_size, history_length
     current_plane = np.ones((board_size, board_size), dtype=np.float32) if current_player == 1 else np.zeros((board_size, board_size), dtype=np.float32)
     channels.append(current_plane)
 
-    # 各チャネルをスタックして 3 次元のnumpy配列にする
-    return np.stack(channels, axis=0)
+    # 各チャネルをスタックして float16 の numpy 配列にする
+    return np.stack(channels, axis=0).astype(np.float16)
 
 def apply_dihedral_transform(input_array, transform_id):
     """
@@ -230,17 +230,17 @@ class AlphaZeroSGFDatasetPreloaded(Dataset):
         常に4要素のテンソルを返します。
         """
         item = self.samples[idx]
-        if len(item) == 5:
-            inp, pol, val, mar, _ = item
+        if len(item) == 4:
+            inp, pol, val, _ = item
         else:
-            inp, pol, val, mar = item
+            inp, pol, val = item
 
-        board_tensor         = torch.tensor(inp, dtype=torch.float32).view(NUM_CHANNELS, BOARD_SIZE, BOARD_SIZE)
-        target_policy_tensor = torch.tensor(pol, dtype=torch.float32)
-        target_value_tensor  = torch.tensor(val, dtype=torch.float32)
-        target_margin_tensor = torch.tensor(mar, dtype=torch.float32)
+        # inp: float16 の numpy 配列 → torch Tensor に変換後、bfloat16 にキャスト
+        board_tensor         = torch.from_numpy(inp).view(NUM_CHANNELS, BOARD_SIZE, BOARD_SIZE).to(torch.bfloat16)
+        target_policy_tensor = torch.tensor(pol, dtype=torch.bfloat16)
+        target_value_tensor  = torch.tensor(val, dtype=torch.bfloat16)
 
-        return board_tensor, target_policy_tensor, target_value_tensor, target_margin_tensor
+        return board_tensor, target_policy_tensor, target_value_tensor
     
     def save_file_counts(self):
         """ファイル処理回数をディスクに保存"""
@@ -323,11 +323,6 @@ def process_sgf_to_samples_from_text(sgf_src, board_size, history_length, augmen
 
     # 勝敗の値として、黒勝ちなら 1.0、白勝ちなら -1.0、引き分け等は 0.0 とする
     target_value = 1.0 if result_str.startswith("B+") else -1.0 if result_str.startswith("W+") else 0.0
-    try:
-        # マージン（差分情報）を取得。解析できなければ 0.0 を使用
-        target_margin = float(result_str[2:]) if result_str[2:] else 0.0
-    except Exception:
-        target_margin = 0.0
 
     # Board クラスのインスタンスを作成（盤面の初期状態は空盤）
     board_obj = Board(sz)
@@ -368,7 +363,6 @@ def process_sgf_to_samples_from_text(sgf_src, board_size, history_length, augmen
                 inp.flatten(),  # 盤面入力を1次元にフラット化
                 pol,            # 変換後のターゲットポリシー
                 np.array([target_value], dtype=np.float32),   # ターゲット値
-                np.array([target_margin], dtype=np.float32)     # ターゲットマージン
             ))
         # 着手がある場合、盤面状態を更新して履歴に追加する
         if move_vals is not None and len(move_vals) > 0 and move_vals[0] != b"":
@@ -415,20 +409,20 @@ def save_inference_model(model, device, model_name):
     モデルをCPUに移動し、torch.jit.traceを用いてTorchScript形式の推論専用モデルを生成・保存する関数。
     保存後、元のデバイスにモデルを戻す。
     """
-    model_cpu = model.cpu()   # モデルをCPUに移動
-    model_cpu.eval()
+    #model_cpu = model.cpu()   # モデルをCPUに移動
+    model.eval()
 
     # 推論のトレース用ダミー入力（形状は [1, NUM_CHANNELS, BOARD_SIZE, BOARD_SIZE]）
-    dummy_input = torch.randn(1, NUM_CHANNELS, BOARD_SIZE, BOARD_SIZE, device=torch.device("cpu"))
+    dummy_input = torch.randn(1, NUM_CHANNELS, BOARD_SIZE, BOARD_SIZE)
 
-    traced_module = torch.jit.trace(model_cpu, dummy_input)  # TorchScript形式に変換
+    traced_module = torch.jit.trace(model, dummy_input)  # TorchScript形式に変換
     inference_model_file = os.path.join(MODEL_OUTPUT_DIR, model_name)
 
     torch.jit.save(traced_module, inference_model_file)  # ファイルに保存
 
     train_logger.info(f"Inference model saved as {inference_model_file}")
 
-    model.to(device)  # 元のデバイスに戻す
+    #Smodel.to(device)  # 元のデバイスに戻す
 
 # ==============================
 # 最良モデル保存用関数(Policy accurach)
@@ -453,7 +447,7 @@ def save_best_acc_model(model, policy_accuracy, device):
     torch.save(model.state_dict(), new_model_file)
     train_logger.info(f"● New best acc model saved: {new_model_file}")
 
-    save_inference_model(model, device, os.path.basename(new_inference_file))
+    #save_inference_model(model, device, os.path.basename(new_inference_file))
 
     # 3) 古いスコア付きファイルを一掃
     pattern = re.compile(r'^(?P<prefix>.+_)(?P<score>\d+\.\d+)\.pt$')
@@ -510,7 +504,7 @@ def save_best_loss_model(model, total_loss, device):
     torch.save(model.state_dict(), new_model_file)
     train_logger.info(f"● New best loss model saved: {new_model_file}")
 
-    save_inference_model(model, device, os.path.basename(new_inference_file))
+    #save_inference_model(model, device, os.path.basename(new_inference_file))
 
     # 3) 古いスコア付きファイルを一掃
     pattern = re.compile(r'^(?P<prefix>.+_)(?P<score>\d+\.\d+)\.pt$')
@@ -549,117 +543,92 @@ def save_best_loss_model(model, total_loss, device):
 # ==============================
 # モデル検証関数（mse_criterion 廃止版）
 # ==============================
+
 def validate_model(model, test_loader, device):
     """
-    高速＋ログ出力あり版 validate_model
-    - デバイス上で Tensor 累積（.item(), .to をループ外へ）
-    - プログレスバーは tqdm で維持
-    - 開始／終了ログ、経過時間、メトリクス出力を元と同じ形式で残す
+    テストデータを使用してモデルのポリシーとバリューを評価する関数。
+
+    Args:
+        model (torch.nn.Module): 評価対象のモデル
+        test_loader (DataLoader): テスト用の DataLoader
+        device (torch.device): 使用デバイス（CPU/GPU/TPU）
+
+    Returns:
+        tuple: (policy_accuracy, average_value_loss, total_loss)
     """
     model.eval()
-
-    total_batches = len(test_loader)
     total_samples = 0
+    policy_loss_sum = torch.zeros((), device=device)
+    value_loss_sum  = torch.zeros((), device=device)
+    correct_preds   = torch.zeros((), device=device)
 
-    # 開始ログ
-    start_time = time.time()
-    train_logger.info(f"[rank 0] validate_model: started with {total_batches} batches")
-
-    # デバイス上で累積する Tensor
-    policy_sum = torch.zeros((), device=device)
-    value_sum  = torch.zeros((), device=device)
-    margin_sum = torch.zeros((), device=device)
-    correct    = torch.zeros((), device=device)
-
-    # 自動デバイス転送 loader
+    # デバイス対応のテストローダー
     val_loader = MpDeviceLoader(test_loader, device)
 
     with torch.no_grad():
-        for boards, t_policies, t_values, t_margins in tqdm(
+        for boards, t_policies, t_values in tqdm(
             val_loader,
             desc="Validation",
             bar_format=bar_fmt,
             position=0,
             **tqdm_kwargs
         ):
-            # --- デバイス転送 ---
-            boards        = boards.to(device,      non_blocking=True)
-            t_policies    = t_policies.to(device,  non_blocking=True)
-            t_values      = t_values.to(device,    non_blocking=True)
-            t_margins     = t_margins.to(device,   non_blocking=True)
+            # デバイス転送
+            boards      = boards.to(device, non_blocking=True, dtype=torch.bfloat16)
+            t_policies  = t_policies.to(device, non_blocking=True, dtype=torch.bfloat16)
+            t_values    = t_values.to(device, non_blocking=True, dtype=torch.bfloat16)
 
-            B = boards.size(0)
-            total_samples += B
+            batch_size = boards.size(0)
+            total_samples += batch_size
 
             # 推論
-            p_logits, (v_pred, m_pred) = model(boards)
+            p_logits, v_pred = model(boards)
 
-            # accuracy
+            # 精度計算
             preds  = p_logits.argmax(dim=1)
             labels = t_policies.argmax(dim=1)
-            correct += (preds == labels).sum()
+            correct_preds += (preds == labels).sum()
 
-            # 損失合計（sum reduction）
-            policy_sum += F.nll_loss(p_logits, labels, reduction='sum')
-            value_sum  += F.mse_loss(v_pred.view(-1), t_values.view(-1), reduction='sum')
-            margin_sum += F.mse_loss(m_pred.view(-1), t_margins.view(-1), reduction='sum')
+            # 損失集計
+            policy_loss_sum += F.cross_entropy(p_logits, labels, reduction='sum')
+            value_loss_sum  += F.mse_loss(v_pred.view(-1), t_values.view(-1), reduction='sum')
 
-            # XLA ステップ（TPUのみ）
+            # TPU同期
             if USE_TPU:
                 xm.mark_step()
 
-    # 終了時間計測＆ログ
-    elapsed = time.time() - start_time
-    m, s = divmod(int(elapsed), 60)
-  
-    # ホスト同期して平均・精度算出
-    avg_policy_loss = (policy_sum / total_samples).item()
-    avg_value_mse   = (value_sum  / total_samples).item()
-    avg_margin_mse  = (margin_sum / total_samples).item()
-    policy_acc      = (correct.float() / total_samples).item()
-    total_loss = w_policy_loss * avg_policy_loss + w_value_loss * avg_value_mse + w_margin_loss * avg_margin_mse
+    # 平均損失と精度計算
+    avg_policy_loss = (policy_loss_sum / total_samples).item()
+    avg_value_loss  = (value_loss_sum  / total_samples).item()
+    policy_accuracy = (correct_preds.float() / total_samples).item()
+    total_loss      = w_policy_loss * avg_policy_loss + w_value_loss * avg_value_loss
+    
+    train_logger.info(f"Validation end: p_acc:{policy_accuracy} weighted_total_loss{total_loss} p_loss:{avg_policy_loss} v_loss:{avg_value_loss}")
+    
+    return policy_accuracy, avg_value_loss, total_loss
 
-    # メトリクスログ（元のフォーマットを踏襲）
-    train_logger.info(f"[rank 0] validation completed in {m}m{s}s")
-    train_logger.info(
-        f"== Validation : total loss: {total_loss:.5f}  policy accuracy:【{policy_acc:.5f}】 value_mse: {avg_value_mse:.5f}, margin_mse: {avg_margin_mse:.5f}"
-    )
-
-    # Validation metrics をファイル出力
-    ts = datetime.datetime.now(JST).strftime("%Y-%m-%d %H:%M:%S")
-    # policy loss
-    with open(os.path.join(LOSS_LOG_DIR, "validation_policy_loss.log"), "a", encoding="utf-8") as f:
-        f.write(f"{ts},{avg_policy_loss:.5f}\n")
-    # value loss
-    with open(os.path.join(LOSS_LOG_DIR, "validation_value_loss.log"), "a", encoding="utf-8") as f:
-        f.write(f"{ts},{avg_value_mse:.5f}\n")
-    # policy accuracy
-    with open(os.path.join(LOSS_LOG_DIR, "validation_policy_acc.log"), "a", encoding="utf-8") as f:
-        f.write(f"{ts},{policy_acc:.5f}\n")
-
-    model.train()
-
-    return policy_acc, avg_value_mse, avg_margin_mse, total_loss
-
-# ==============================
-# チェックポイント保存関数
-# ==============================
 def save_checkpoint(model, optimizer, scheduler, best_total_loss, best_policy_accuracy, checkpoint_file):
+    """
+    トレーニング途中のモデル状態を保存する関数。
 
-    train_logger.info(f"Checkpoint saved start to {checkpoint_file}")
-
+    Args:
+        model (torch.nn.Module): 保存対象のモデル
+        optimizer (Optimizer): モデルのオプティマイザ
+        scheduler (_LRScheduler): 学習率スケジューラ
+        best_total_loss (float): これまでの最小合計損失
+        best_policy_accuracy (float): これまでの最高ポリシー精度
+        checkpoint_file (str): 保存先ファイルパス
+    """
     checkpoint = {
         'model_state_dict': model.state_dict(),
         'optimizer_state_dict': optimizer.state_dict(),
-        'scheduler_state_dict': scheduler.state_dict(),  # スケジューラ状態の保存
-        'best_total_loss': best_total_loss, # トータルロスベースのベスト保存
-        'best_policy_accuracy': best_policy_accuracy # 精度ベースのベスト保存
+        'scheduler_state_dict': scheduler.state_dict(),
+        'best_total_loss': best_total_loss,
+        'best_policy_accuracy': best_policy_accuracy,
     }
     torch.save(checkpoint, checkpoint_file)
-
-    train_logger.info(f"Checkpoint saved end to {checkpoint_file}")
-
-# 訓練中のコンソール表示が崩れないように、ログ出力はしないバージョン
+    train_logger.info(f"Checkpoint saved to {checkpoint_file}")
+    
 def save_checkpoint_nolog(model, optimizer, scheduler, best_total_loss, best_policy_accuracy, checkpoint_file):
     """
     訓練中のコンソール表示を行わない版チェックポイント保存

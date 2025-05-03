@@ -1,6 +1,6 @@
 import os
 import configparser
-from config import BASE_DIR, get_logger
+from config import BASE_DIR, get_logger, PREFIX
 
 train_logger = get_logger()
 
@@ -74,7 +74,7 @@ def load_config(config_path):
     }
 
 # 設定ファイルのパス（BASE_DIR配下にあると仮定）
-CONFIG_PATH = os.path.join(BASE_DIR, "config_py_3.ini")
+CONFIG_PATH = os.path.join(BASE_DIR, f"config_py_{PREFIX}.ini")
 # 設定ファイルを読み込み、各パラメータを辞書に格納
 config_params = load_config(CONFIG_PATH)
 

@@ -32,7 +32,7 @@ from dataset import (
 
 from config import PREFIX, USE_TPU, FORCE_RELOAD, TRAIN_SGF_DIR, VAL_SGF_DIR, MODEL_OUTPUT_DIR, INFERENCE_MODEL_PREFIX, CHECKPOINT_FILE, bar_fmt, get_logger, tqdm_kwargs, LOG_DIR, LOSS_LOG_DIR, JST, COUNTS_FILE
 
-from utils import BOARD_SIZE, HISTORY_LENGTH, NUM_CHANNELS, num_residual_blocks, model_channels, batch_size, learning_rate, patience, factor, number_max_files, number_proc_files, CONFIG_PATH, val_interval, w_policy_loss, w_value_loss, w_margin_loss
+from utils import BOARD_SIZE, HISTORY_LENGTH, NUM_CHANNELS, num_residual_blocks, model_channels, batch_size, learning_rate, patience, factor, number_max_files, number_proc_files, CONFIG_PATH, val_interval, w_policy_loss, w_value_loss
 
 import torch.multiprocessing as mp
 mp.set_sharing_strategy('file_system')
@@ -81,11 +81,12 @@ def train_one_iteration(model, train_loader, optimizer, device, local_loop_cnt, 
 
     model.train()
 
-    total_loss = total_policy = total_value = total_margin = 0.0
+    total_loss = total_policy = total_value = 0.0
     
     # ログ用ファイルをバッチ外で一度だけオープン
     policy_log_f = None
     value_log_f  = None
+
     if rank == 0:
         policy_log_f = open(
             os.path.join(LOSS_LOG_DIR, "weighted_policy_loss.log"),
@@ -102,22 +103,21 @@ def train_one_iteration(model, train_loader, optimizer, device, local_loop_cnt, 
 
     for i, batch in enumerate(train_loader, start=1):
         # unpack batch
-        boards, target_policies, target_values, target_margins = batch
+        boards, target_policies, target_values = batch
 
         # 非同期転送
-        boards          = boards.to(device, non_blocking=True)
-        target_policies = target_policies.to(device, non_blocking=True)
-        target_values   = target_values.to(device, non_blocking=True)
-        target_margins  = target_margins.to(device, non_blocking=True)
+        # 入力・ラベルとも bfloat16 にキャスト
+        boards          = boards.to(device, non_blocking=True, dtype=torch.bfloat16)
+        target_policies = target_policies.to(device, non_blocking=True, dtype=torch.bfloat16)
+        target_values   = target_values.to(device, non_blocking=True, dtype=torch.bfloat16)
 
         # 順伝播→損失計算（損失定義を検証時と同じクロスエントロピーに統一）
-        pred_policy, (pred_value, pred_margin) = model(boards)
+        pred_policy, pred_value = model(boards)  # margin出力なしモデルに合わせて修正
         # one-hot の target_policies からラベルインデックスに変換
         target_labels = torch.argmax(target_policies, dim=1)
-        policy_loss = F.nll_loss(pred_policy, target_labels)
+        policy_loss = F.cross_entropy(pred_policy, target_labels)
         value_loss  = F.mse_loss(pred_value.view(-1), target_values.view(-1))
-        margin_loss = F.mse_loss(pred_margin.view(-1), target_margins.view(-1))
-        loss = w_policy_loss * policy_loss + w_value_loss * value_loss + w_margin_loss * margin_loss
+        loss = w_policy_loss * policy_loss + w_value_loss * value_loss  # margin項を削除
 
         # weighted loss のログ追記 ──
         if rank == 0:
@@ -147,7 +147,6 @@ def train_one_iteration(model, train_loader, optimizer, device, local_loop_cnt, 
         total_loss += loss.item()
         total_policy += policy_loss.item()
         total_value  += value_loss.item()
-        total_margin += margin_loss.item()
         batch_pred = pred_policy.argmax(dim=1)
         batch_true = target_policies.argmax(dim=1)
         overall_correct += (batch_pred == batch_true).sum().item()
@@ -230,8 +229,11 @@ def _mp_fn(rank):
 
         # モデル／オプティマイザ／スケジューラ生成
         model = EnhancedResNetPolicyValueNetwork(
-            BOARD_SIZE, model_channels, num_residual_blocks, NUM_CHANNELS
-        ).to(device)
+             BOARD_SIZE,
+             NUM_CHANNELS,         # in_channels: 入力テンソルのチャネル数
+             model_channels,       # num_channels: ネットワーク内部のチャネル数
+             num_residual_blocks   # num_blocks: ResidualBlock の数
+        ).to(device, dtype=torch.bfloat16)
 
         optimizer = optim.Adam(model.parameters(), lr=learning_rate)
         scheduler = optim.lr_scheduler.ReduceLROnPlateau(
@@ -247,21 +249,21 @@ def _mp_fn(rank):
             current_lr = optimizer.param_groups[0]["lr"]
             mode = scheduler.state_dict()['mode']
             bad_epochs = scheduler.num_bad_epochs
-            train_logger.info(f"[rank {rank}] =========== params ============")
-            train_logger.info(f"[rank {rank}] epoch: {local_loop_cnt}")
-            train_logger.info(f"[rank {rank}] optimizer lr_rate    (from optimizer): {current_lr:.8f}")
-            train_logger.info(f"[rank {rank}] scheduler patience:  {patience}")
-            train_logger.info(f"[rank {rank}] scheduler factor:    {factor}")
-            train_logger.info(f"[rank {rank}] scheduler mode       (from checkpoint): {mode}")
-            train_logger.info(f"[rank {rank}] scheduler bad_epochs (from checkpoint): {bad_epochs}")
-            train_logger.info(f"[rank {rank}] best_total_loss      (from checkpoint): {best_total_loss:.5f}")
-            train_logger.info(f"[rank {rank}] best_policy_accuracy (from checkpoint): {best_policy_accuracy:.5f}")
-            train_logger.info(f"[rank {rank}] number_max_files: {number_max_files}")
-            train_logger.info(f"[rank {rank}] val_interval:     {val_interval}")
-            train_logger.info(f"[rank {rank}] w_policy_loss:    {w_policy_loss}")
-            train_logger.info(f"[rank {rank}] w_value_loss:     {w_value_loss}")
-            train_logger.info(f"[rank {rank}] w_value_loss:     {w_margin_loss}")
-            train_logger.info(f"[rank {rank}] ===============================")
+            train_logger.info(f"[rank {rank}] =============== runtime params ============")
+            train_logger.info(f"[rank {rank}] epoch                     : {local_loop_cnt}")
+            train_logger.info(f"[rank {rank}] batch_size                : {batch_size}")
+            train_logger.info(f"[rank {rank}] optimizer lr_rate         : {current_lr:.8f}")
+            train_logger.info(f"[rank {rank}] scheduler patience        : {patience}")
+            train_logger.info(f"[rank {rank}] scheduler factor          : {factor}")
+            train_logger.info(f"[rank {rank}] scheduler mode       (chk): {mode}")
+            train_logger.info(f"[rank {rank}] scheduler bad_epochs (chk): {bad_epochs}")
+            train_logger.info(f"[rank {rank}] best_total_loss      (chk): {best_total_loss:.5f}")
+            train_logger.info(f"[rank {rank}] best_policy_accuracy (chk): {best_policy_accuracy:.5f}")
+            train_logger.info(f"[rank {rank}] number_max_files          : {number_max_files}")
+            train_logger.info(f"[rank {rank}] val_interval              : {val_interval}")
+            train_logger.info(f"[rank {rank}] w_policy_loss             : {w_policy_loss}")
+            train_logger.info(f"[rank {rank}] w_value_loss              : {w_value_loss}")
+            train_logger.info(f"[rank {rank}] ===========================================")
         
         # ① 全rank共通でnumber_max_filesファイルを全SGFファイルより選択
         all_selected = weighted_file_sample(all_files, COUNTS_FILE, number_max_files)
@@ -277,10 +279,10 @@ def _mp_fn(rank):
         for zip_path, entry_name in selected:
             sgf_src = zip_ref.read(entry_name).decode('utf-8')
             file_id = f"{zip_path}:{entry_name}"
-            for inp, pol, val, mar in process_sgf_to_samples_from_text(
+            for inp, pol, val in process_sgf_to_samples_from_text(
                     sgf_src, BOARD_SIZE, HISTORY_LENGTH, augment_all=False):
                 # タプルの末尾に file_id を追加
-                samples.append((inp, pol, val, mar, file_id))
+                samples.append((inp, pol, val, file_id))
 
         if not samples:
             train_logger.warning(f"[rank {rank}] No samples generated. Skipping epoch {local_loop_cnt}.")
@@ -318,27 +320,29 @@ def _mp_fn(rank):
 
         local_loop_cnt += 1
 
+        #xm.rendezvous("sync")
+
         # 検証とモデル保存（ordinal=0 のみ）
         if ordinal == 0 and local_loop_cnt % val_interval == 0:
             train_logger.info(f"[rank {rank}] Starting validation after epoch {local_loop_cnt}")
             
             # 検証を実行
             with torch.no_grad():
-                policy_acc, avg_value_mse, avg_margin_mse, total_loss = validate_model(model, test_loader, device)
+                policy_acc, avg_value_loss, total_loss = validate_model(model, test_loader, device)  # margin項なしに合わせて修正
 
             if total_loss < best_total_loss:
                 train_logger.info(f"[rank {rank}] _mp_fn: total_loss {best_total_loss:.5f} → {total_loss:.5f}" )
                 best_total_loss = total_loss
                 save_best_loss_model(model, total_loss, device)
-            else:
-                save_inference_model(model, device, f"{INFERENCE_MODEL_PREFIX}_loss_tmp.pt")
+            #else:
+            #    save_inference_model(model, device, f"{INFERENCE_MODEL_PREFIX}_loss_tmp.pt")
 
             if policy_acc > best_policy_accuracy:
-                train_logger.info(f"[rank {rank}] _mp_fn: total_loss {best_policy_accuracy:.5f} → {policy_acc:.5f}" )
+                train_logger.info(f"[rank {rank}] _mp_fn: total_acc {best_policy_accuracy:.5f} → {policy_acc:.5f}" )
                 best_policy_accuracy = policy_acc
                 save_best_acc_model(model, policy_acc, device)
-            else:
-                save_inference_model(model, device, f"{INFERENCE_MODEL_PREFIX}_acc_tmp.pt")
+            #else:
+            #    save_inference_model(model, device, f"{INFERENCE_MODEL_PREFIX}_acc_tmp.pt")
 
             # scheduler.step() 実行前の学習率を表示
             before_lr = optimizer.param_groups[0]["lr"]
@@ -377,21 +381,22 @@ def _mp_fn(rank):
 # ==============================
 def main():
     # ── CLI引数から渡された値と適用後のグローバル変数を出力 ──
-    train_logger.info(f"PREFIX: {PREFIX}")
-    train_logger.info(f"FORCE_RELOAD: {FORCE_RELOAD}")
-    train_logger.info(f"VAL_SGF_DIR {VAL_SGF_DIR}")
-    train_logger.info(f"TRAIN_SGF_DIR {TRAIN_SGF_DIR}")
-    train_logger.info(f"MODEL_OUTPUT_DIR {MODEL_OUTPUT_DIR}")
-    train_logger.info(f"CHECKPOINT_FILE: {CHECKPOINT_FILE}")
+    train_logger.info(f"PREFIX           : {PREFIX}")
+    train_logger.info(f"FORCE_RELOAD     : {FORCE_RELOAD}")
+    train_logger.info(f"VAL_SGF_DIR      : {VAL_SGF_DIR}")
+    train_logger.info(f"TRAIN_SGF_DIR    : {TRAIN_SGF_DIR}")
+    train_logger.info(f"MODEL_OUTPUT_DIR : {MODEL_OUTPUT_DIR}")
+    train_logger.info(f"CHECKPOINT_FILE  : {CHECKPOINT_FILE}")
     train_logger.info(f"=========== ini ============")
-    train_logger.info(f"patience: {patience}")
-    train_logger.info(f"factor: {factor}")
-    train_logger.info(f"number_max_files: {number_max_files}")
-    train_logger.info(f"val_interval: {val_interval}")
-    train_logger.info(f"w_policy_loss: {w_policy_loss}")
-    train_logger.info(f"w_value_loss:  {w_value_loss}")
-    train_logger.info(f"w_margin_loss:  {w_margin_loss}")
-    train_logger.info(f"===============================")
+    train_logger.info(f"batch_size       : {batch_size}")
+    train_logger.info(f"number_max_files : {number_max_files }")
+    train_logger.info(f"patience         : {patience}")
+    train_logger.info(f"factor           : {factor}")
+    train_logger.info(f"number_max_files : {number_max_files}")
+    train_logger.info(f"val_interval     : {val_interval}")
+    train_logger.info(f"w_policy_loss    : {w_policy_loss}")
+    train_logger.info(f"w_value_loss     : {w_value_loss}")
+    train_logger.info(f"============================")
 
     # ここに各種初期化、設定ロード、ロガー設定など
     if USE_TPU:

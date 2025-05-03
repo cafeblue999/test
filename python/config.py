@@ -36,7 +36,7 @@ FORCE_RELOAD = force_reload_flag
 # ディレクトリ設定
 # ==============================
 # ディレクトリ設定（PREFIX は環境変数から取得）
-PREFIX = "3"
+PREFIX = "4"
 PREFIX = os.environ.get("PREFIX", PREFIX)
 
 if USE_COLAB:
@@ -63,8 +63,6 @@ CHECKPOINT_FILE = os.path.join(BASE_DIR, CHECKPOINT_FILE_PREFIX + ".pt")
 # モデル出力用のディレクトリが存在しない場合は自動で作成
 if not os.path.exists(MODEL_OUTPUT_DIR):
     os.makedirs(MODEL_OUTPUT_DIR)
-
-
 
 # ==============================
 # tqdm の表示
