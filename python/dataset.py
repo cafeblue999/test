@@ -409,8 +409,8 @@ def save_inference_model(model, device, model_name):
     モデルをCPUに移動し、torch.jit.traceを用いてTorchScript形式の推論専用モデルを生成・保存する関数。
     保存後、元のデバイスにモデルを戻す。
     """
-    #model_cpu = model.cpu()   # モデルをCPUに移動
-    model.eval()
+    model_cpu = model.cpu()   # モデルをCPUに移動
+    model_cpu.eval()
 
     # 推論のトレース用ダミー入力（形状は [1, NUM_CHANNELS, BOARD_SIZE, BOARD_SIZE]）
     dummy_input = torch.randn(1, NUM_CHANNELS, BOARD_SIZE, BOARD_SIZE)
@@ -421,8 +421,10 @@ def save_inference_model(model, device, model_name):
     torch.jit.save(traced_module, inference_model_file)  # ファイルに保存
 
     train_logger.info(f"Inference model saved as {inference_model_file}")
+    
+    model_cpu.train()
 
-    #Smodel.to(device)  # 元のデバイスに戻す
+    model_cpu.to(device)  # 元のデバイスに戻す
 
 # ==============================
 # 最良モデル保存用関数(Policy accurach)
@@ -603,8 +605,22 @@ def validate_model(model, test_loader, device):
     policy_accuracy = (correct_preds.float() / total_samples).item()
     total_loss      = w_policy_loss * avg_policy_loss + w_value_loss * avg_value_loss
     
-    train_logger.info(f"Validation end: p_acc:{policy_accuracy} weighted_total_loss{total_loss} p_loss:{avg_policy_loss} v_loss:{avg_value_loss}")
+    train_logger.info(f"Validation end: p_acc:{policy_accuracy:.5f} w_total_loss:{total_loss:.5f} p_loss:{avg_policy_loss:.5f} v_loss:{avg_value_loss:.5f}")
     
+    # Validation metrics をファイル出力
+    ts = datetime.datetime.now(JST).strftime("%Y-%m-%d %H:%M:%S")
+    # policy loss
+    with open(os.path.join(LOSS_LOG_DIR, "validation_policy_loss.log"), "a", encoding="utf-8") as f:
+        f.write(f"{ts},{avg_policy_loss:.5f}\n")
+    # value loss
+    with open(os.path.join(LOSS_LOG_DIR, "validation_value_loss.log"), "a", encoding="utf-8") as f:
+        f.write(f"{ts},{avg_value_loss:.5f}\n")
+    # policy accuracy
+    with open(os.path.join(LOSS_LOG_DIR, "validation_policy_acc.log"), "a", encoding="utf-8") as f:
+        f.write(f"{ts},{policy_accuracy:.5f}\n")
+
+    model.train()
+
     return policy_accuracy, avg_value_loss, total_loss
 
 def save_checkpoint(model, optimizer, scheduler, best_total_loss, best_policy_accuracy, checkpoint_file):
