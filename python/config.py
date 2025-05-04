@@ -3,6 +3,7 @@
 # ------------------------------
 import os
 import sys
+from pathlib import Path
 import argparse
 from tqdm import tqdm             # 進捗表示用ライブラリ（ループの状況を視覚的に表示）
 import time                         # 時間計測・待機処理に利用
@@ -26,43 +27,37 @@ force_reload_flag = (args.force_reload == "True")
 
 # ===== 固定定義：環境切り替え用フラグ =====
 # TPUやGoogle Colab環境で動作させるかどうかのフラグ。環境に応じた挙動を切り替える
-USE_TPU = True      # TPU を利用する場合は True にする
+# TPU/GPU 切り替えフラグ (環境変数 USE_TPU="0"/"false"/"no" で False、未指定 or "1"/"true"/"yes" で True)
+USE_TPU = os.environ.get("USE_TPU", "1").lower() in ("1", "true", "yes")
 USE_COLAB = True    # Google Colab 環境で実行する場合は True にする
 
 # グローバル変数として強制再読み込みフラグを定義（プログラム起動時のみ True にする）
 FORCE_RELOAD = force_reload_flag
 
-# ==============================
-# ディレクトリ設定
-# ==============================
-# ディレクトリ設定（PREFIX は環境変数から取得）
-PREFIX = "4"
-PREFIX = os.environ.get("PREFIX", PREFIX)
+# PREFIX は環境変数から取得（デフォルトは "4"）
+PREFIX = os.environ.get("PREFIX", "4")
 
-if USE_COLAB:
-    # Google Colab環境向けのディレクトリ設定。Google Drive内の特定のフォルダを利用する
-    BASE_DIR = "/content/drive/My Drive/sgf"              # ベースディレクトリ
-    TRAIN_SGF_DIR = os.path.join(BASE_DIR, f"train_sgf_{PREFIX}")  # 学習用SGFファイルのディレクトリ
-    VAL_SGF_DIR = os.path.join(BASE_DIR, "test")            # 評価用SGFファイルのディレクトリ
-    TEST_SGFS_ZIP = os.path.join(VAL_SGF_DIR, "test_sgfs.zip")# テスト用SGFファイル群をまとめたZIPファイル
-    MODEL_OUTPUT_DIR = os.path.join(BASE_DIR, "models")      # モデル出力用ディレクトリ
+# プロジェクトルート（この config.py のあるフォルダの一つ上の階層）を自動取得
+BASE_DIR = Path(__file__).parent.parent.resolve()
 
-else:
-    # ローカル環境（例: Windows環境）用のディレクトリ設定
-    BASE_DIR = r"D:\igo\simple2"
-    TRAIN_SGF_DIR = os.path.join(BASE_DIR, "train_sgf")
-    VAL_SGF_DIR = os.path.join(BASE_DIR, "test")
-    TEST_SGFS_ZIP = os.path.join(VAL_SGF_DIR, "test_sgfs.zip")
-    MODEL_OUTPUT_DIR = os.path.join(BASE_DIR, "models")
+# 学習用／評価用ディレクトリ、テストZIP
+TRAIN_SGF_DIR = BASE_DIR / f"train_sgf_{PREFIX}"
+VAL_SGF_DIR   = BASE_DIR / "test"
+TEST_SGFS_ZIP = VAL_SGF_DIR / "test_sgfs.zip"
+
+# モデル出力用ディレクトリ
+MODEL_OUTPUT_DIR = BASE_DIR / "models"
+
+# ディレクトリがなければ作成（存在すればスキップ）
+MODEL_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 # sgfファイル用進捗チェックポイントファイルのパス
 INFERENCE_MODEL_PREFIX = F"inference_{PREFIX}"
 CHECKPOINT_FILE_PREFIX = f"checkpoint_{PREFIX}" 
 CHECKPOINT_FILE = os.path.join(BASE_DIR, CHECKPOINT_FILE_PREFIX + ".pt")
 
-# モデル出力用のディレクトリが存在しない場合は自動で作成
-if not os.path.exists(MODEL_OUTPUT_DIR):
-    os.makedirs(MODEL_OUTPUT_DIR)
+# インポート時にディレクトリを作成（親ディレクトリを含めて、存在すればスキップ）
+Path(MODEL_OUTPUT_DIR).mkdir(parents=True, exist_ok=True)
 
 # ==============================
 # tqdm の表示
@@ -85,8 +80,13 @@ bar_fmt="{desc}:{percentage:3.0f}% {n:>4d}/{total:>4d} [{elapsed}<{remaining}, {
 # タイムゾーン設定（日本時間）
 JST = timezone(timedelta(hours=9), 'JST')
 
-# ログ出力ディレクトリ（Google Drive直下）
-LOG_DIR = "/content/drive/My Drive/sgf/logs"
+# ログ出力ディレクトリ（Colab の Drive マウント or ローカル logs フォルダ）
+colab_log = Path("/content/drive/My Drive/sgf/logs")
+if colab_log.exists():
+    LOG_DIR = colab_log
+else:
+    LOG_DIR = BASE_DIR / "logs"
+LOG_DIR.mkdir(parents=True, exist_ok=True)
 
 # タイムスタンプは実行ごとに固定化（環境変数に保存）
 if "TRAIN_LOG_TIMESTAMP" not in os.environ:
@@ -100,11 +100,11 @@ LOG_FILE_PATH = os.path.join(LOG_DIR, f"train_log_{log_timestamp}.log")
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO")  # 例: "DEBUG", "INFO", "WARNING", "ERROR"
 
 # lossログ用ディレクトリ
-LOSS_LOG_DIR = os.path.join(LOG_DIR, "loss_logs")
-os.makedirs(LOSS_LOG_DIR, exist_ok=True)
+LOSS_LOG_DIR = LOG_DIR / "loss_logs"
+LOSS_LOG_DIR.mkdir(parents=True, exist_ok=True)
 
 # ファイル処理カウントの保存先
-COUNTS_FILE = os.path.join(LOG_DIR, "file_process_counts.pkl")
+COUNTS_FILE = LOG_DIR / "file_process_counts.pkl"
 
 # ==============================
 # FileLogger クラス定義

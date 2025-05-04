@@ -3,19 +3,19 @@ import zipfile
 import random
 import time
 import datetime
-import pytz
 import gc
 import numpy as np
+import pickle
 import torch
 import torch.optim as optim
 import torch.nn.functional as F
+
 from torch.utils.data import DataLoader
-from tqdm import tqdm
-from model import EnhancedResNetPolicyValueNetwork
-import pickle
 import torch_xla.core.xla_model as xm
 import torch.distributed as dist
 from torch_xla.distributed.parallel_loader import MpDeviceLoader
+
+from model import EnhancedResNetPolicyValueNetwork
 
 from dataset import (
     AlphaZeroSGFDatasetPreloaded,
@@ -30,7 +30,7 @@ from dataset import (
     load_checkpoint
 )
 
-from config import PREFIX, USE_TPU, FORCE_RELOAD, TRAIN_SGF_DIR, VAL_SGF_DIR, MODEL_OUTPUT_DIR, INFERENCE_MODEL_PREFIX, CHECKPOINT_FILE, bar_fmt, get_logger, tqdm_kwargs, LOG_DIR, LOSS_LOG_DIR, JST, COUNTS_FILE
+from config import PREFIX, USE_TPU, FORCE_RELOAD, BASE_DIR, TRAIN_SGF_DIR, VAL_SGF_DIR, MODEL_OUTPUT_DIR, INFERENCE_MODEL_PREFIX, CHECKPOINT_FILE, bar_fmt, get_logger, tqdm_kwargs, LOG_DIR, LOSS_LOG_DIR, JST, COUNTS_FILE
 
 from utils import BOARD_SIZE, HISTORY_LENGTH, NUM_CHANNELS, num_residual_blocks, model_channels, batch_size, learning_rate, patience, factor, number_max_files, number_proc_files, CONFIG_PATH, val_interval, w_policy_loss, w_value_loss
 
@@ -102,22 +102,25 @@ def train_one_iteration(model, train_loader, optimizer, device, local_loop_cnt, 
     log_interval = max(1, total_batches // 10)  # 10% ごとにログ
 
     for i, batch in enumerate(train_loader, start=1):
+        # まずは必ずクリアしてからバッチ処理
+        optimizer.zero_grad()
         # unpack batch
         boards, target_policies, target_values = batch
 
         # 非同期転送
-        # 入力・ラベルとも bfloat16 にキャスト
+        # TPU: bfloat16／long にキャスト
         boards          = boards.to(device, non_blocking=True, dtype=torch.bfloat16)
-        target_policies = target_policies.to(device, non_blocking=True, dtype=torch.bfloat16)
+        target_policies = target_policies.to(device, non_blocking=True, dtype=torch.long)
         target_values   = target_values.to(device, non_blocking=True, dtype=torch.bfloat16)
 
         # 順伝播→損失計算（損失定義を検証時と同じクロスエントロピーに統一）
-        pred_policy, pred_value = model(boards)  # margin出力なしモデルに合わせて修正
-        # one-hot の target_policies からラベルインデックスに変換
-        target_labels = torch.argmax(target_policies, dim=1)
-        policy_loss = F.cross_entropy(pred_policy, target_labels)
-        value_loss  = F.mse_loss(pred_value.view(-1), target_values.view(-1))
-        loss = w_policy_loss * policy_loss + w_value_loss * value_loss  # margin項を削除
+        # TPU: bfloat16 演算でフォワード→ロス計算
+        pred_policy, pred_value = model(boards)
+        target_labels = target_policies.argmax(dim=1)
+        # loss は float32 にキャストして計算
+        policy_loss = F.cross_entropy(pred_policy.float(), target_labels)
+        value_loss  = F.mse_loss(pred_value.view(-1).float(), target_values.view(-1).float())
+        loss = w_policy_loss * policy_loss + w_value_loss * value_loss
 
         # weighted loss のログ追記 ──
         if rank == 0:
@@ -133,15 +136,10 @@ def train_one_iteration(model, train_loader, optimizer, device, local_loop_cnt, 
             train_logger.error(f"[rank {rank}] Invalid loss: {loss}. Skipping this batch.")
             continue
 
-        # 逆伝播→更新
-        optimizer.zero_grad()
+        # TPU: 逆伝播→明示的ステップ→更新
         loss.backward()
-        
-        if USE_TPU:
-            xm.mark_step()  # lazy実行を明示的に発火させる
-            xm.optimizer_step(optimizer, barrier=True)
-        else:
-            optimizer.step()
+        xm.mark_step()
+        xm.optimizer_step(optimizer, barrier=True)
 
         # メトリクス集計
         total_loss += loss.item()
@@ -214,7 +212,10 @@ def _mp_fn(rank):
     ]
     all_files.extend(sgf_files)           
     train_logger.info(f"[rank {rank}] Available {len(all_files)} SGF files (shared across all ranks)")
-
+    
+    # all_files をシャッフル(すでにtrain.zip作成時にファイル単位でシャッフルされているが念の為)
+    random.shuffle(all_files)
+    
     # 全ファイルID一覧を作成（各要素を "zip_path:entry_name" 形式の文字列に）
     all_file_ids = [f"{zp}:{entry}" for zp, entry in all_files]
 
@@ -383,6 +384,7 @@ def main():
     # ── CLI引数から渡された値と適用後のグローバル変数を出力 ──
     train_logger.info(f"PREFIX           : {PREFIX}")
     train_logger.info(f"FORCE_RELOAD     : {FORCE_RELOAD}")
+    train_logger.info(f"BASE_DIR         : {BASE_DIR}")
     train_logger.info(f"VAL_SGF_DIR      : {VAL_SGF_DIR}")
     train_logger.info(f"TRAIN_SGF_DIR    : {TRAIN_SGF_DIR}")
     train_logger.info(f"MODEL_OUTPUT_DIR : {MODEL_OUTPUT_DIR}")

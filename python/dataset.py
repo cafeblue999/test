@@ -8,12 +8,15 @@ import pytz
 import numpy as np
 import torch
 import torch.nn.functional as F
-import torch_xla.core.xla_model as xm
-from torch_xla.distributed.parallel_loader import MpDeviceLoader
 from torch.utils.data import Dataset
 from tqdm import tqdm
-from config import USE_TPU, get_logger, PREFIX, MODEL_OUTPUT_DIR, INFERENCE_MODEL_PREFIX, bar_fmt, TEST_SGFS_ZIP, tqdm_kwargs, LOSS_LOG_DIR, JST, COUNTS_FILE
+from config import USE_TPU, USE_COLAB, get_logger, PREFIX, MODEL_OUTPUT_DIR, INFERENCE_MODEL_PREFIX, bar_fmt, TEST_SGFS_ZIP, tqdm_kwargs, LOSS_LOG_DIR, JST, COUNTS_FILE
 from utils  import BOARD_SIZE, NUM_CHANNELS, w_policy_loss, w_value_loss
+
+if USE_TPU:
+    import torch_xla.core.xla_model as xm
+    from torch_xla.distributed.parallel_loader import MpDeviceLoader
+
 
 train_logger = get_logger()
 
@@ -74,8 +77,8 @@ def build_input_from_history(history, current_player, board_size, history_length
     current_plane = np.ones((board_size, board_size), dtype=np.float32) if current_player == 1 else np.zeros((board_size, board_size), dtype=np.float32)
     channels.append(current_plane)
 
-    # 各チャネルをスタックして float16 の numpy 配列にする
-    return np.stack(channels, axis=0).astype(np.float16)
+    # TPU 前提では入力は float32 のまま保持し、Tensor 化時に bfloat16 に変換
+    return np.stack(channels, axis=0).astype(np.float32)
 
 def apply_dihedral_transform(input_array, transform_id):
     """
@@ -203,10 +206,13 @@ class AlphaZeroSGFDatasetPreloaded(Dataset):
     前処理済みのSGFサンプルをメモリ上に保持するDatasetクラス。
     各サンプルは、flattenした盤面の配列、ターゲットポリシー、ターゲット値、ターゲットマージンからなる。
     """
-    def __init__(self, samples, file_list) :
+    def __init__(self, samples, file_list=None) :
         self.samples = samples
-        # ここで train.py 側から渡されたファイル情報を保持
-        self.file_list   = file_list 
+        # file_list が与えられなかった場合はダミーの None リストをセット
+        if file_list is None:
+            self.file_list = [None] * len(samples)
+        else:
+            self.file_list = file_list
 
         # ── ファイル処理カウンタの読み込み or 初期化 ──
         if os.path.exists(COUNTS_FILE):
@@ -226,8 +232,7 @@ class AlphaZeroSGFDatasetPreloaded(Dataset):
     def __getitem__(self, idx):
         """
         訓練用サンプル（5要素）とテスト用サンプル（4要素）の両方を扱います。
-        file_process_counts の更新は train.py 側で行うため、ここでは副作用を持たせません。
-        常に4要素のテンソルを返します。
+        常に3要素の Tensor を返します。
         """
         item = self.samples[idx]
         if len(item) == 4:
@@ -235,12 +240,31 @@ class AlphaZeroSGFDatasetPreloaded(Dataset):
         else:
             inp, pol, val = item
 
-        # inp: float16 の numpy 配列 → torch Tensor に変換後、bfloat16 にキャスト
-        board_tensor         = torch.from_numpy(inp).view(NUM_CHANNELS, BOARD_SIZE, BOARD_SIZE).to(torch.bfloat16)
-        target_policy_tensor = torch.tensor(pol, dtype=torch.bfloat16)
-        target_value_tensor  = torch.tensor(val, dtype=torch.bfloat16)
+        # board_tensor の生成：numpy.ndarray または Tensor を受け付け、torch.bfloat16 の Tensor に変換
+        if torch.is_tensor(inp):
+            board_tensor = inp.to(torch.bfloat16)
+        elif isinstance(inp, np.ndarray):
+            board_tensor = (
+                torch.from_numpy(inp)
+                .view(NUM_CHANNELS, BOARD_SIZE, BOARD_SIZE)
+                .to(torch.bfloat16)
+            )
+        else:
+            raise TypeError(f"Unsupported input type for dataset: {type(inp)}")
 
-        return board_tensor, target_policy_tensor, target_value_tensor
+        # policy_target をラベル用の LongTensor に変換(cross_entropy に渡すラベルは本来 long 型である)
+        if torch.is_tensor(pol):
+            policy_tensor = pol.to(torch.long)
+        else:
+            policy_tensor = torch.tensor(pol, dtype=torch.long)
+
+        # TPU: bfloat16 にキャスト
+        if torch.is_tensor(val):
+            value_tensor = val.to(torch.bfloat16)
+        else:
+            value_tensor = torch.tensor(val, dtype=torch.bfloat16)
+
+        return board_tensor, policy_tensor, value_tensor
     
     def save_file_counts(self):
         """ファイル処理回数をディスクに保存"""
@@ -354,8 +378,8 @@ def process_sgf_to_samples_from_text(sgf_src, board_size, history_length, augmen
                 target_policy = np.zeros(sz * sz + 1, dtype=np.float32)
                 target_policy[sz * sz] = 1.0
 
-        # データ拡張処理（dihedral変換）：augment_allがTrueなら8通り、Falseならランダムに1通りを適用
-        transforms = range(8) if augment_all else [np.random.randint(0, 8)]
+        # データ拡張処理（dihedral変換）：augment_allがTrueなら8通り、Falseなら元のSGFサンプルのみを返す
+        transforms = range(8) if augment_all else [0]
         for t in transforms:
             inp = apply_dihedral_transform(input_tensor, t)
             pol = transform_policy(target_policy, t, sz)
@@ -577,7 +601,7 @@ def validate_model(model, test_loader, device):
         ):
             # デバイス転送
             boards      = boards.to(device, non_blocking=True, dtype=torch.bfloat16)
-            t_policies  = t_policies.to(device, non_blocking=True, dtype=torch.bfloat16)
+            t_policies  = t_policies.to(device, non_blocking=True)
             t_values    = t_values.to(device, non_blocking=True, dtype=torch.bfloat16)
 
             batch_size = boards.size(0)

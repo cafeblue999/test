@@ -18,7 +18,7 @@ def load_config(config_path):
         dict: 取得した各パラメータをキーに持つ辞書
     """
     config = configparser.ConfigParser()  # ConfigParserオブジェクトの生成
-    config.read(config_path)             # ファイルの読み込み
+    config.read(config_path, encoding='utf-8')            # ファイルの読み込み
 
     try:
         # BOARDセクション：盤のサイズ（例：19x19）を取得。指定がなければ"19"を使用
