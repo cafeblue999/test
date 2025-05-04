@@ -476,23 +476,21 @@ def save_best_acc_model(model, policy_accuracy, device):
     #save_inference_model(model, device, os.path.basename(new_inference_file))
 
     # 3) 古いスコア付きファイルを一掃
-    pattern = re.compile(r'^(?P<prefix>.+_)(?P<score>\d+\.\d+)\.pt$')
-
+    # “model_{PREFIX}_acc_” を prefix としてキャプチャ
+    pattern = re.compile(
+        rf'^(?P<prefix>model_{re.escape(PREFIX)}_acc_)(?P<score>\d+\.\d+)\.pt$'
+    )
     groups = {}
     for fname in os.listdir(MODEL_OUTPUT_DIR):
         m = pattern.match(fname)
         if not m:
             continue
-        prefix = m.group('prefix')        # ex. "model_ALL_" or "inference_ALL_"
+        prefix = m.group('prefix') 
         score  = float(m.group('score'))  # ex. 0.34118
         groups.setdefault(prefix, []).append((fname, score))
 
     # accモデルのみ削除対象に限定
     for prefix, flist in groups.items():
-        # “_acc_” プレフィックス以外はスキップ
-        if not prefix.endswith("_acc_"):
-            continue
-
         # 各プレフィックスで最大スコアを計算
         max_score = max(score for _, score in flist)
         for fname, score in flist:
@@ -533,7 +531,10 @@ def save_best_loss_model(model, total_loss, device):
     #save_inference_model(model, device, os.path.basename(new_inference_file))
 
     # 3) 古いスコア付きファイルを一掃
-    pattern = re.compile(r'^(?P<prefix>.+_)(?P<score>\d+\.\d+)\.pt$')
+    # “model_{PREFIX}_acc_” を prefix としてキャプチャ
+    pattern = re.compile(
+        rf'^(?P<prefix>model_{re.escape(PREFIX)}_loss_)(?P<score>\d+\.\d+)\.pt$'
+    )
 
     groups = {}
     for fname in os.listdir(MODEL_OUTPUT_DIR):
@@ -551,9 +552,6 @@ def save_best_loss_model(model, total_loss, device):
     }
     # lossモデルのみ削除対象に限定 
     for prefix, flist in groups.items():
-        # “_loss_” プレフィックス以外はスキップ
-        if not prefix.endswith("_loss_"):
-            continue
         # 各プレフィックスで最小スコア（最良モデル）を計算
         min_score = min(score for _, score in flist)
         for fname, score in flist:

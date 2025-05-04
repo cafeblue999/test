@@ -394,7 +394,6 @@ def main():
     train_logger.info(f"number_max_files : {number_max_files }")
     train_logger.info(f"patience         : {patience}")
     train_logger.info(f"factor           : {factor}")
-    train_logger.info(f"number_max_files : {number_max_files}")
     train_logger.info(f"val_interval     : {val_interval}")
     train_logger.info(f"w_policy_loss    : {w_policy_loss}")
     train_logger.info(f"w_value_loss     : {w_value_loss}")
