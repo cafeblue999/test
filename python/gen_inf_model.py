@@ -10,12 +10,13 @@ from model import EnhancedResNetPolicyValueNetwork
 # ====== 設定 ======
 STATE_DICT_DIR   = r"G:\マイドライブ\sgf\models"       # state_dict ファイル置き場
 MODEL_OUTPUT_DIR = r"D:\igo\simple2_sdl\x64\Release"   # 推論モデル保存先
-NUM_CHANNELS     = 17
+IN_CHANNELS      = 17
+NUM_CHANNELS     = 256
 BOARD_SIZE       = 19
 NUM_BLOCKS       = 30       # ResNet の residual block 数を固定
 PREFIX           = "4-30"   # state_dict ファイル名の接頭辞
 DEVICE           = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
+# =================
 
 def find_latest_state_dict(directory: str) -> str:
     """
@@ -49,9 +50,10 @@ def save_inference_model(
         orig_device = next(model.parameters()).device
     except StopIteration:
         orig_device = device
-
+    print(f"[INFO] Original model device: {orig_device}")
+    
     model.to(device)
-    dummy = torch.randn(1, NUM_CHANNELS, BOARD_SIZE, BOARD_SIZE, device=device)
+    dummy = torch.randn(1, IN_CHANNELS, BOARD_SIZE, BOARD_SIZE, device=device)
     traced = torch.jit.trace(model, dummy)
     traced_cpu = traced.to("cpu")
     os.makedirs(MODEL_OUTPUT_DIR, exist_ok=True)
@@ -76,8 +78,8 @@ if __name__ == "__main__":
     # 3) モデル生成＆state_dict 読み込み
     model = EnhancedResNetPolicyValueNetwork(
         board_size=BOARD_SIZE,
-        in_channels=NUM_CHANNELS,
-        num_channels=256,
+        in_channels=IN_CHANNELS,
+        num_channels=NUM_CHANNELS,
         num_blocks=NUM_BLOCKS
     )
     state_dict = torch.load(state_dict_path, map_location=DEVICE)
