@@ -306,7 +306,7 @@ def prepare_test_dataset(sgf_dir, board_size, history_length, augment_all, outpu
         for name in tqdm(sgf_names, desc="Processing TEST SGF files"):
             try:
                 sgf_src = zf.read(name).decode('utf-8')
-                file_samples = process_sgf_to_samples_from_text(sgf_src, board_size, history_length, augment_all=False)
+                file_samples = process_sgf_to_samples_from_text(sgf_src, board_size, history_length, augment_all=0)
                 all_samples.extend(file_samples)
             except Exception as e:
                 train_logger.error(f"Error processing {name} from zip: {e}")
@@ -325,7 +325,10 @@ def process_sgf_to_samples_from_text(sgf_src, board_size, history_length, augmen
     1つのSGF文字列から複数の学習サンプルを生成する関数。
     ・SGF文字列をパースし、棋譜の各ノードごとに盤面の履歴を取得
     ・各ノードに対して、入力テンソル、ターゲットポリシー、ターゲット値、マージンのサンプルを生成
-    ・augment_all フラグがTrueなら8通り（dihedral変換）でデータ拡張を行う
+    ・param augment_all: int
+      0 → 元のサンプルのみ
+      1 → 4 パターン（0:恒等, 2:180°, 4:上下反転, 6:上下反転+180°）
+      2 → 8 パターン（ID 0〜7 全て）
     """
     samples = []
     try:
@@ -378,8 +381,20 @@ def process_sgf_to_samples_from_text(sgf_src, board_size, history_length, augmen
                 target_policy = np.zeros(sz * sz + 1, dtype=np.float32)
                 target_policy[sz * sz] = 1.0
 
-        # データ拡張処理（dihedral変換）：augment_allがTrueなら8通り、Falseなら元のSGFサンプルのみを返す
-        transforms = range(8) if augment_all else [0]
+        # データ拡張処理（dihedral変換）:
+        #   augment_all == 0 → 元サンプルのみ (ID=0)
+        #   augment_all == 1 → 4パターン (0,2,4,6)
+        #   augment_all == 2 → 全8パターン (0〜7)
+        if augment_all == 0:
+            transforms = [0]
+        elif augment_all == 1:
+            transforms = [0, 2, 4, 6]
+        elif augment_all == 2:
+            transforms = list(range(8))
+        else:
+            # 想定外の値は元サンプルのみ
+            transforms = [0]
+
         for t in transforms:
             inp = apply_dihedral_transform(input_tensor, t)
             pol = transform_policy(target_policy, t, sz)

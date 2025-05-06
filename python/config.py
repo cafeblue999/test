@@ -41,9 +41,11 @@ PREFIX = os.environ.get("PREFIX", "4")
 BASE_DIR = Path(__file__).parent.parent.resolve()
 
 # 学習用／評価用ディレクトリ、テストZIP
-TRAIN_SGF_DIR = BASE_DIR / f"train_sgf_{PREFIX}"
-VAL_SGF_DIR   = BASE_DIR / "test"
-TEST_SGFS_ZIP = VAL_SGF_DIR / "test_sgfs.zip"
+TRAIN_SGF_DIR     = BASE_DIR / f"train_sgf_{PREFIX}"
+TRAIN_SGFS_ZIP    = TRAIN_SGF_DIR / "train.zip"
+VAL_SGF_DIR       = BASE_DIR / "test"
+TEST_SGFS_ZIP     = VAL_SGF_DIR / "test_sgfs.zip"
+TEST_DATASET_PKL  = VAL_SGF_DIR / "test_dataset.pkl"
 
 # モデル出力用ディレクトリ
 MODEL_OUTPUT_DIR = BASE_DIR / "models"

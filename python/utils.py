@@ -36,7 +36,9 @@ def load_config(config_path):
 
         # TRAINセクション：エポック数、バッチサイズ、学習率、patience、及び学習率減衰率factorを取得
         num_epochs = int(config.get("TRAIN", "num_epochs", fallback="100"))
-        batch_size = int(config.get("TRAIN", "batch_size", fallback="256"))
+        train_batch_size = int(config.get("TRAIN", "train_batch_size", fallback="256"))
+        test_batch_size = int(config.get("TRAIN", "test_batch_size", fallback="256"))
+        argument = int(config.get("TRAIN", "argument", fallback="0"))
         learning_rate = float(config.get("TRAIN", "learning_rate", fallback="0.001"))
         patience = int(config.get("TRAIN", "patience", fallback="10"))
         factor = float(config.get("TRAIN", "factor", fallback="0.8"))
@@ -61,7 +63,9 @@ def load_config(config_path):
         "num_residual_blocks": num_residual_blocks,
         "model_channels": model_channels,
         "num_epochs": num_epochs,
-        "batch_size": batch_size,
+        "train_batch_size": train_batch_size,
+        "test_batch_size": test_batch_size,
+        "argument": argument,
         "learning_rate": learning_rate,
         "patience": patience,
         "factor": factor,
@@ -86,7 +90,9 @@ NUM_ACTIONS = config_params["NUM_ACTIONS"]
 num_residual_blocks = config_params["num_residual_blocks"]
 model_channels = config_params["model_channels"]
 num_epochs = config_params["num_epochs"]
-batch_size = config_params["batch_size"]
+train_batch_size = config_params["train_batch_size"]
+test_batch_size = config_params["test_batch_size"]
+argument = config_params["argument"]
 learning_rate = config_params["learning_rate"]
 patience = config_params["patience"]
 factor = config_params["factor"]
@@ -96,5 +102,3 @@ val_interval = config_params["val_interval"]
 w_policy_loss = config_params["w_policy_loss"]
 w_value_loss = config_params["w_value_loss"]
 w_margin_loss = config_params["w_margin_loss"]
-
-

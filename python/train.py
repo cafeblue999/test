@@ -30,9 +30,9 @@ from dataset import (
     load_checkpoint
 )
 
-from config import PREFIX, USE_TPU, FORCE_RELOAD, BASE_DIR, TRAIN_SGF_DIR, VAL_SGF_DIR, MODEL_OUTPUT_DIR, INFERENCE_MODEL_PREFIX, CHECKPOINT_FILE, bar_fmt, get_logger, tqdm_kwargs, LOG_DIR, LOSS_LOG_DIR, JST, COUNTS_FILE
+from config import PREFIX, USE_TPU, FORCE_RELOAD, BASE_DIR, TRAIN_SGF_DIR, TRAIN_SGFS_ZIP, VAL_SGF_DIR, MODEL_OUTPUT_DIR, INFERENCE_MODEL_PREFIX, CHECKPOINT_FILE, bar_fmt, get_logger, tqdm_kwargs, LOG_DIR, LOSS_LOG_DIR, JST, COUNTS_FILE, TEST_DATASET_PKL
 
-from utils import BOARD_SIZE, HISTORY_LENGTH, NUM_CHANNELS, num_residual_blocks, model_channels, batch_size, learning_rate, patience, factor, number_max_files, number_proc_files, CONFIG_PATH, val_interval, w_policy_loss, w_value_loss
+from utils import BOARD_SIZE, HISTORY_LENGTH, NUM_CHANNELS, num_residual_blocks, model_channels, learning_rate, patience, factor, number_max_files, number_proc_files, CONFIG_PATH, val_interval, w_policy_loss, w_value_loss, argument, train_batch_size, test_batch_size
 
 import torch.multiprocessing as mp
 mp.set_sharing_strategy('file_system')
@@ -58,7 +58,7 @@ def weighted_file_sample(all_files, counts_file, number_max_files):
     # 全ファイルIDリストと重みリストを生成
     file_ids = [f"{zp}:{ename}" for zp, ename in all_files]
     # べき乗で「浅いカウント」をさらに強調
-    exponent = 2.0  # 1.0 なら元の逆数、2.0 にすると 1/(count+1)^2 の重み
+    exponent = 3.0  # 1.0 なら元の逆数、2.0 にすると 1/(count+1)^2 の重み
     weights = [
         1.0 / ((counts.get(fid, 0) + 1) ** exponent)
         for fid in file_ids
@@ -187,13 +187,13 @@ def _mp_fn(rank):
 
     if ordinal == 0:
         # テストデータ準備（ループ外で一度だけ）
-        test_dataset_pickle = os.path.join(VAL_SGF_DIR, "test_dataset.pkl")
+        test_dataset_pickle = TEST_DATASET_PKL
         test_samples = prepare_test_dataset(
-            VAL_SGF_DIR, BOARD_SIZE, HISTORY_LENGTH, augment_all=False, output_file=test_dataset_pickle
+            VAL_SGF_DIR, BOARD_SIZE, HISTORY_LENGTH, augment_all=0, output_file=test_dataset_pickle
         )
         test_loader = DataLoader(
             AlphaZeroSGFDatasetPreloaded(test_samples, []),
-            batch_size=batch_size, shuffle=False
+            batch_size=test_batch_size, shuffle=False
         )
         train_logger.info(f"[rank {rank}] Test loader ready. {len(test_loader.dataset)} samples")
 
@@ -201,7 +201,7 @@ def _mp_fn(rank):
     best_policy_accuracy = 0.0
 
     # 全ファイル読み込み (ZIP をループ外でオープン)
-    zip_path = os.path.join(TRAIN_SGF_DIR, 'train.zip')
+    zip_path = TRAIN_SGFS_ZIP
     zip_ref  = zipfile.ZipFile(zip_path, 'r')
     all_files = []
     # .sgfファイルのうち "analyzed" を含まないものを一覧化
@@ -252,7 +252,8 @@ def _mp_fn(rank):
             bad_epochs = scheduler.num_bad_epochs
             train_logger.info(f"[rank {rank}] =============== runtime params ============")
             train_logger.info(f"[rank {rank}] epoch                     : {local_loop_cnt}")
-            train_logger.info(f"[rank {rank}] batch_size                : {batch_size}")
+            train_logger.info(f"[rank {rank}] train_batch_size          : {train_batch_size}")
+            train_logger.info(f"[rank {rank}] test_batch_size           : {test_batch_size}")
             train_logger.info(f"[rank {rank}] optimizer lr_rate         : {current_lr:.8f}")
             train_logger.info(f"[rank {rank}] scheduler patience        : {patience}")
             train_logger.info(f"[rank {rank}] scheduler factor          : {factor}")
@@ -281,7 +282,7 @@ def _mp_fn(rank):
             sgf_src = zip_ref.read(entry_name).decode('utf-8')
             file_id = f"{zip_path}:{entry_name}"
             for inp, pol, val in process_sgf_to_samples_from_text(
-                    sgf_src, BOARD_SIZE, HISTORY_LENGTH, augment_all=False):
+                    sgf_src, BOARD_SIZE, HISTORY_LENGTH, augment_all=argument):
                 # タプルの末尾に file_id を追加
                 samples.append((inp, pol, val, file_id))
 
@@ -304,7 +305,7 @@ def _mp_fn(rank):
         # ④ DistributedSampler は使わずに、DataLoader の shuffle だけでランダム化
         train_loader = DataLoader(
             train_dataset,
-            batch_size=batch_size,
+            batch_size=train_batch_size,
             shuffle=True,               # ← ここだけで十分
             drop_last=True,
             num_workers=1,
@@ -325,7 +326,7 @@ def _mp_fn(rank):
 
         # 検証とモデル保存（ordinal=0 のみ）
         if ordinal == 0 and local_loop_cnt % val_interval == 0:
-            train_logger.info(f"[rank {rank}] Starting validation after epoch {local_loop_cnt}")
+            train_logger.info(f"[rank {rank}] Starting validation after epoch {local_loop_cnt - 1}")
             
             # 検証を実行
             with torch.no_grad():
@@ -390,7 +391,9 @@ def main():
     train_logger.info(f"MODEL_OUTPUT_DIR : {MODEL_OUTPUT_DIR}")
     train_logger.info(f"CHECKPOINT_FILE  : {CHECKPOINT_FILE}")
     train_logger.info(f"=========== ini ============")
-    train_logger.info(f"batch_size       : {batch_size}")
+    train_logger.info(f"train_batch_size : {train_batch_size}")
+    train_logger.info(f"test_batch_size  : {test_batch_size}")
+    train_logger.info(f"argument         : {argument}")
     train_logger.info(f"number_max_files : {number_max_files }")
     train_logger.info(f"patience         : {patience}")
     train_logger.info(f"factor           : {factor}")
