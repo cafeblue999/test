@@ -13,8 +13,8 @@ MODEL_OUTPUT_DIR = r"D:\igo\simple2_sdl\x64\Release"   # 推論モデル保存�
 IN_CHANNELS      = 17
 NUM_CHANNELS     = 256
 BOARD_SIZE       = 19
-NUM_BLOCKS       = 30       # ResNet の residual block 数を固定
-PREFIX           = "4-30"   # state_dict ファイル名の接頭辞
+NUM_BLOCKS       = 40       # ResNet の residual block 数を固定
+PREFIX           = "4-40"   # state_dict ファイル名の接頭辞
 DEVICE           = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 # =================
 

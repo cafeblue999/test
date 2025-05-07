@@ -48,28 +48,50 @@ def weighted_file_sample(all_files, counts_file, number_max_files):
     counts_file: path to pickle with {file_id: count}
     number_max_files: number of files to sample
     """
-    # 保存済みカウントをロード
+    # 1) 保存済みカウントをロード
     if os.path.exists(counts_file):
         with open(counts_file, "rb") as f:
             counts = pickle.load(f)
     else:
         counts = {}
 
-    # 全ファイルIDリストと重みリストを生成
+    # 2) ファイルIDリストを作成
     file_ids = [f"{zp}:{ename}" for zp, ename in all_files]
-    # べき乗で「浅いカウント」をさらに強調
-    exponent = 3.0  # 1.0 なら元の逆数、2.0 にすると 1/(count+1)^2 の重み
+
+    # 3) 重みを計算（べき乗で浅いカウントを強調）
+    exponent = 3.0
     weights = [
         1.0 / ((counts.get(fid, 0) + 1) ** exponent)
         for fid in file_ids
     ]
-
-    # 正規化して確率分布に
     total_w = float(sum(weights))
     probs   = [w / total_w for w in weights]
 
-    # numpy で重み付き非復元サンプリング
+    # 4) サンプリング数の決定
     k = min(len(all_files), number_max_files)
+
+    # 5) 未使用ファイル（count==0）の優先選択
+    unused_idxs = [i for i, fid in enumerate(file_ids) if counts.get(fid, 0) == 0]
+    if unused_idxs:
+        # 5-1) 未使用が k 個以上あれば、その中から k 個を均等サンプリング
+        if len(unused_idxs) >= k:
+            chosen = np.random.choice(unused_idxs, size=k, replace=False)
+            return [all_files[i] for i in chosen]
+
+        # 5-2) 未使用が不足する場合：まず全て取得し、残りを重み付きで補充
+        selected = list(unused_idxs)
+        remaining_k = k - len(selected)
+
+        rem_idxs    = [i for i in range(len(all_files)) if i not in selected]
+        rem_weights = [weights[i] for i in rem_idxs]
+        rem_total   = float(sum(rem_weights))
+        rem_probs   = [w / rem_total for w in rem_weights]
+
+        fill = np.random.choice(rem_idxs, size=remaining_k, replace=False, p=rem_probs)
+        selected.extend(fill.tolist())
+        return [all_files[i] for i in selected]
+
+    # 6) 未使用ファイルがなければ、通常の重み付きサンプリング
     idxs = np.random.choice(len(all_files), size=k, replace=False, p=probs)
 
     return [all_files[i] for i in idxs]
@@ -168,7 +190,6 @@ def train_one_iteration(model, train_loader, optimizer, device, local_loop_cnt, 
 # ==============================
 # TPU分散環境で動作するメイン処理
 # ==============================
-from torch.utils.data.distributed import DistributedSampler
 def _mp_fn(rank):
    
     # デバイス初期化
@@ -249,14 +270,17 @@ def _mp_fn(rank):
         if rank == 0:
             current_lr = optimizer.param_groups[0]["lr"]
             mode = scheduler.state_dict()['mode']
+            chk_factor = scheduler.state_dict()['factor']
+            chk_patience = scheduler.state_dict()['patience']
             bad_epochs = scheduler.num_bad_epochs
             train_logger.info(f"[rank {rank}] =============== runtime params ============")
             train_logger.info(f"[rank {rank}] epoch                     : {local_loop_cnt}")
             train_logger.info(f"[rank {rank}] train_batch_size          : {train_batch_size}")
             train_logger.info(f"[rank {rank}] test_batch_size           : {test_batch_size}")
-            train_logger.info(f"[rank {rank}] optimizer lr_rate         : {current_lr:.8f}")
-            train_logger.info(f"[rank {rank}] scheduler patience        : {patience}")
-            train_logger.info(f"[rank {rank}] scheduler factor          : {factor}")
+            train_logger.info(f"[rank {rank}] train argument            : {argument}")
+            train_logger.info(f"[rank {rank}] optimizer lr_rate    (chk): {current_lr:.8f}")
+            train_logger.info(f"[rank {rank}] scheduler patience   (chk): {chk_patience}")
+            train_logger.info(f"[rank {rank}] scheduler factor     (chk): {chk_factor}")
             train_logger.info(f"[rank {rank}] scheduler mode       (chk): {mode}")
             train_logger.info(f"[rank {rank}] scheduler bad_epochs (chk): {bad_epochs}")
             train_logger.info(f"[rank {rank}] best_total_loss      (chk): {best_total_loss:.5f}")
@@ -360,7 +384,7 @@ def _mp_fn(rank):
 
             # チェックポイント保存
             save_checkpoint(model, optimizer, scheduler, best_total_loss, best_policy_accuracy, CHECKPOINT_FILE)
-            train_logger.info(f"[rank {rank}] Epoch {local_loop_cnt} completed.")
+            train_logger.info(f"[rank {rank}] Epoch {local_loop_cnt - 1} completed.")
 
             # エポック終了後に未処理ファイル数をログ＆カウント保存
             try:
