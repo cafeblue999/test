@@ -323,68 +323,83 @@ def prepare_test_dataset(sgf_dir, board_size, history_length, augment_all, outpu
 def process_sgf_to_samples_from_text(sgf_src, board_size, history_length, augment_all):
     """
     1つのSGF文字列から複数の学習サンプルを生成する関数。
-    ・SGF文字列をパースし、棋譜の各ノードごとに盤面の履歴を取得
-    ・各ノードに対して、入力テンソル、ターゲットポリシー、ターゲット値、マージンのサンプルを生成
-    ・param augment_all: int
-      0 → 元のサンプルのみ
-      1 → 4 パターン（0:恒等, 2:180°, 4:上下反転, 6:上下反転+180°）
-      2 → 8 パターン（ID 0〜7 全て）
+    ・各ノード（着手）ごとに input_tensor, policy, value を構成
+    ・augment_all に応じてデータ拡張（回転・反転）も実施
+    ・10手目までのサンプルは 50% の確率で間引く（ただし盤面更新は継続）
     """
     samples = []
+
     try:
         sgf_data = parse_sgf(sgf_src)
     except Exception as e:
         train_logger.error(f"Error processing SGF text: {e}")
         return samples
+
     root = sgf_data["root"]
 
+    # 盤面サイズ（SZプロパティが無ければ引数を使う）
     try:
-        # 盤面サイズは、rootプロパティ「SZ」から取得。取得に失敗すれば引数のboard_sizeを使用
         sz = int(root.get(b'SZ')[0].decode('utf-8'))
     except Exception:
         sz = board_size
 
-    # 勝敗情報を示すプロパティ「RE」を取得。なければ"不明"とする
+    # 勝敗判定（REプロパティ：B+〜, W+〜, 引き分け）
     result_prop = root.get(b'RE') if b'RE' in root else None
     result_str = result_prop[0].decode('utf-8') if result_prop and len(result_prop) > 0 else "不明"
-
-    # 勝敗の値として、黒勝ちなら 1.0、白勝ちなら -1.0、引き分け等は 0.0 とする
     target_value = 1.0 if result_str.startswith("B+") else -1.0 if result_str.startswith("W+") else 0.0
 
-    # Board クラスのインスタンスを作成（盤面の初期状態は空盤）
+    # 盤面管理クラスの初期化（空盤）
     board_obj = Board(sz)
-    # 初期盤面（空盤）を履歴に追加
-    history_boards = [board_obj.board.copy().astype(np.float32)]
-    current_player = 1  # 初手は黒（1）が始める
+    history_boards = [board_obj.board.copy().astype(np.float32)]  # 初期盤面を履歴に保存
 
-    # SGF内の各ノードを順次処理する
+    current_player = 1  # 黒番（1）が先手
+    move_number = 0     # 現在の手数（0始まり）
+
+    # --- 各ノード（手）を順に処理 ---
     for node in sgf_data["nodes"]:
-        # 現在のプレイヤーに応じて、着手プロパティを決定
+        # === 序盤間引き処理（例：10手目までは50%の確率でスキップ） ===
+        if move_number <= 10 and np.random.rand() < 0.5:
+            # 着手情報が存在すれば、盤面状態と履歴は更新する
+            move_prop = b'B' if current_player == 1 else b'W'
+            move_vals = node.get(move_prop)
+            if move_vals and len(move_vals) > 0 and move_vals[0] != b"":
+                try:
+                    move = move_vals[0]
+                    col = ord(move.decode('utf-8')[0]) - ord('a')
+                    row = ord(move.decode('utf-8')[1]) - ord('a')
+                    board_obj.play((row, col), 'b' if current_player == 1 else 'w')
+                    history_boards.append(board_obj.board.copy().astype(np.float32))
+                except Exception as e:
+                    train_logger.warning(f"Error updating board from SGF text: {e}")
+            current_player = 2 if current_player == 1 else 1
+            move_number += 1
+            continue  # サンプルとしては使わずスキップ
+
+        # 現在プレイヤーの手を取得（B または W）
         move_prop = b'B' if current_player == 1 else b'W'
         move_vals = node.get(move_prop)
-        # 現在の盤面履歴からネットワーク入力となるテンソルを作成
+
+        # 履歴から入力テンソル作成
         input_tensor = build_input_from_history(history_boards, current_player, sz, history_length)
+
+        # --- ポリシーターゲットの作成 ---
         if move_vals is None or len(move_vals) == 0 or move_vals[0] == b"":
-            # 着手情報が無い場合は、パスとして扱い、盤面外を示すインデックスを1にする
+            # PASS 手（空文字）の場合：最後のインデックスに1を立てる
             target_policy = np.zeros(sz * sz + 1, dtype=np.float32)
             target_policy[sz * sz] = 1.0
         else:
             try:
-                # 着手情報のデコード処理。1文字目が列、2文字目が行（'a'～など）で指定される
                 move = move_vals[0]
                 col = ord(move.decode('utf-8')[0]) - ord('a')
                 row = ord(move.decode('utf-8')[1]) - ord('a')
                 target_policy = np.zeros(sz * sz + 1, dtype=np.float32)
-                target_policy[row * sz + col] = 1.0  # 該当マスを1に設定
+                target_policy[row * sz + col] = 1.0
             except Exception as e:
                 train_logger.warning(f"Error parsing move in SGF text: {e}")
                 target_policy = np.zeros(sz * sz + 1, dtype=np.float32)
-                target_policy[sz * sz] = 1.0
+                target_policy[sz * sz] = 1.0  # fallback to PASS
 
-        # データ拡張処理（dihedral変換）:
-        #   augment_all == 0 → 元サンプルのみ (ID=0)
-        #   augment_all == 1 → 4パターン (0,2,4,6)
-        #   augment_all == 2 → 全8パターン (0〜7)
+        # --- データ拡張：dihedral変換（回転・反転） ---
         if augment_all == 0:
             transforms = [0]
         elif augment_all == 1:
@@ -392,33 +407,38 @@ def process_sgf_to_samples_from_text(sgf_src, board_size, history_length, augmen
         elif augment_all == 2:
             transforms = list(range(8))
         else:
-            # 想定外の値は元サンプルのみ
+            transforms = [0]  # fallback
+
+        # PASS手は拡張しても意味的に変わらないため、1通りに限定（データ偏り防止）
+        if np.argmax(target_policy) == sz * sz:
             transforms = [0]
 
         for t in transforms:
             inp = apply_dihedral_transform(input_tensor, t)
             pol = transform_policy(target_policy, t, sz)
             samples.append((
-                inp.flatten(),  # 盤面入力を1次元にフラット化
-                pol,            # 変換後のターゲットポリシー
-                np.array([target_value], dtype=np.float32),   # ターゲット値
+                inp.flatten(),                                   # 入力テンソル（flatten）
+                pol,                                             # ポリシーターゲット
+                np.array([target_value], dtype=np.float32),     # 勝敗ターゲット
             ))
-        # 着手がある場合、盤面状態を更新して履歴に追加する
+
+        # --- 着手に応じて盤面を更新し、履歴に追加 ---
         if move_vals is not None and len(move_vals) > 0 and move_vals[0] != b"":
             try:
                 move = move_vals[0]
                 col = ord(move.decode('utf-8')[0]) - ord('a')
                 row = ord(move.decode('utf-8')[1]) - ord('a')
-                # Boardクラスのplayメソッドを用いて石を置く（黒の場合'b'、白の場合'w'）
                 board_obj.play((row, col), 'b' if current_player == 1 else 'w')
-                # 盤面状態をコピーして履歴リストに追加
                 history_boards.append(board_obj.board.copy().astype(np.float32))
             except Exception as e:
                 train_logger.warning(f"Error updating board from SGF text: {e}")
-        # プレイヤーの交代：黒→白、白→黒
+
+        # プレイヤー交代（1→2→1...）
         current_player = 2 if current_player == 1 else 1
+        move_number += 1  # 手数を進める
 
     return samples
+
 
 # ==============================
 # データセットの保存／読み込み関数
